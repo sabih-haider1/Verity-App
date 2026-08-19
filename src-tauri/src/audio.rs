@@ -362,6 +362,50 @@ mod tests {
         assert!(to_mono_16k(&[], 2, 48_000).is_empty());
     }
 
+    /// Runs the real enumeration against whatever host this is built on, so
+    /// the Windows output-device path is exercised by CI rather than only
+    /// type-checked. A machine with no audio hardware is not a failure — CI
+    /// runners often have none — but if it does list devices, the invariants
+    /// that make selection work must hold.
+    #[test]
+    fn real_device_listing_holds_its_invariants() {
+        let Ok(devices) = list_devices() else {
+            eprintln!("no audio host available; skipping");
+            return;
+        };
+        for device in &devices {
+            eprintln!(
+                "device: {:?} loopback={} default={}",
+                device.name, device.is_loopback, device.is_default
+            );
+        }
+
+        // The name is the only device id the UI and preferences carry, so a
+        // duplicate would make two devices indistinguishable and could send
+        // capture to the wrong one.
+        let mut names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "device names must be unique: {names:?}");
+
+        // The setup screen offers the first loopback entry, so any loopback
+        // marked default has to sort ahead of the ones that are not.
+        let loopbacks: Vec<bool> = devices
+            .iter()
+            .filter(|d| d.is_loopback)
+            .map(|d| d.is_default)
+            .collect();
+        if let Some(first_plain) = loopbacks.iter().position(|is_default| !is_default) {
+            assert!(
+                !loopbacks[first_plain..]
+                    .iter()
+                    .any(|is_default| *is_default),
+                "a default loopback must not sort after a non-default one"
+            );
+        }
+    }
+
     #[test]
     fn default_output_leads_and_names_taken_by_an_input_are_dropped() {
         let existing = vec![AudioDevice {

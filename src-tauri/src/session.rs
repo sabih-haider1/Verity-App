@@ -134,8 +134,7 @@ pub async fn run_session(
     let processor = tokio::spawn(async move {
         let mut history: Vec<(String, String)> = Vec::new();
         while let Some(utterance) = utterance_rx.recv().await {
-            match process_utterance(&processor_app, &client, &settings, &history, utterance).await
-            {
+            match process_utterance(&processor_app, &client, &settings, &history, utterance).await {
                 Ok(Some((question, answer))) => {
                     history.push((question, answer));
                     if history.len() > MAX_HISTORY_TURNS {
@@ -675,7 +674,10 @@ mod tests {
     #[test]
     fn conversation_history_is_empty_by_default_and_formatted_when_present() {
         assert_eq!(format_conversation(&[]), "None yet.");
-        let history = vec![("Tell me about a project.".to_string(), "I built...".to_string())];
+        let history = vec![(
+            "Tell me about a project.".to_string(),
+            "I built...".to_string(),
+        )];
         assert_eq!(
             format_conversation(&history),
             "Interviewer: Tell me about a project.\nYou: I built..."
