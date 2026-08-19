@@ -63,36 +63,6 @@ Nothing to install. Windows exposes every output device as a capture source, so
 Verity lists your speakers/headphones directly — pick the one the call plays
 through (it is preselected) and you are done. Headphones work fine.
 
----
-
-## When nothing is being transcribed
-
-Every capture failure looks the same from the HUD: it sits there and no
-question appears. `audio-probe` tells you which half is broken, with no API key
-and no network.
-
-It ships in the same CI artifact as the installer (`audio-probe.exe` on
-Windows), or build it yourself:
-
-```bash
-cargo run --release --manifest-path audio-probe/Cargo.toml
-```
-
-```
-audio-probe            # capture the default output device (system audio)
-audio-probe --list     # just enumerate what this machine exposes
-audio-probe 3          # capture device 3 from that list
-```
-
-Play the interviewer's audio while it runs and read the meter:
-
-| What you see | What it means |
-|---|---|
-| **RMS moves, "capture WORKS"** | The machine is fine. Select that exact device in Verity — if it still fails there, the bug is above capture, not in it. |
-| **"opened but delivered SILENCE"** | The device opened but carries no audio. The call is almost certainly playing through a *different* device — re-run against the other numbers, especially your headphones. |
-| **"could not capture this device"** | That endpoint cannot be opened at all. Try another number from the list. |
-| **No devices listed** | Windows sees no sound hardware. |
-
 ### macOS 13+
 
 Apple's ScreenCaptureKit taps system audio with no virtual device. It needs
@@ -126,6 +96,56 @@ You now hear the call normally, and Verity hears exactly what you hear.
 If the app hears nothing, the usual cause is a browser that picked its output
 device before the Multi-Output Device existed: quit it completely, reopen, and
 reselect the speaker in the call app's own audio settings.
+
+---
+
+## When nothing is being transcribed
+
+Every capture failure looks the same from the HUD: it sits there and no
+question appears. That covers several unrelated causes, and fixing the wrong
+one wastes a build cycle, so work through these in order.
+
+### 1. Rule out the machine itself, with no Verity code involved
+
+`audio-probe` opens a device with the same primitive Verity uses (`cpal`) and
+prints a live RMS meter — no API key, no network, none of Verity's own code in
+the path. It ships in the same CI artifact as the installer
+(`audio-probe.exe` on Windows), or build it yourself:
+
+```bash
+cargo run --release --manifest-path audio-probe/Cargo.toml
+```
+
+```
+audio-probe            # capture the default output device (system audio)
+audio-probe --list     # just enumerate what this machine exposes
+audio-probe 3          # capture device 3 from that list
+```
+
+Play the interviewer's audio while it runs and read the meter:
+
+| What you see | What it means |
+|---|---|
+| **RMS moves, "capture WORKS"** | The machine is fine. Continue to step 2 — this same device, selected inside Verity, is now the thing to test. |
+| **"opened but delivered SILENCE"** | The device opened but carries no audio. The call is almost certainly playing through a *different* device — re-run against the other numbers, especially your headphones. |
+| **"could not capture this device"** | That endpoint cannot be opened at all. Try another number from the list. |
+| **No devices listed** | The OS sees no sound hardware. |
+
+### 2. If the probe works but Verity still shows nothing
+
+Verity writes its own append-only log next to `desktop-preferences.json`:
+
+| Platform | Location |
+|---|---|
+| Windows | `%APPDATA%\dev.verity.assistant\debug.log` |
+| macOS | `~/Library/Application Support/dev.verity.assistant/debug.log` |
+
+It records, for every session: the exact device string the Start button sent,
+whether the stream opened or the specific error if it didn't, and whether the
+realtime capture callback ever delivered a single message. Reproduce the
+failure, then open that file — the last few lines say exactly which of those
+three failed, which is the difference between "select a different device" and
+"file a bug."
 
 ---
 

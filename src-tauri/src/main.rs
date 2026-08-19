@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod debuglog;
 #[cfg(all(target_os = "macos", feature = "native-system-audio"))]
 mod native_audio;
 mod platform;
@@ -40,6 +41,7 @@ struct AppState {
     capture: Mutex<Option<CaptureHandle>>,
     preferences_path: Mutex<Option<PathBuf>>,
     preferences: Mutex<preferences::Preferences>,
+    debug_log_path: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Serialize)]
@@ -192,6 +194,10 @@ async fn start_listening(
     state: State<'_, AppState>,
     device: String,
 ) -> Result<StartResult, String> {
+    let log_path = state.debug_log_path.lock().unwrap().clone();
+    if let Some(path) = &log_path {
+        debuglog::log(path, &format!("start_listening: device = {device:?}"));
+    }
     if state.capture.lock().unwrap().is_some() {
         return Err("A listening session is already active.".to_string());
     }
@@ -213,22 +219,71 @@ async fn start_listening(
     let capture = if device == audio::NATIVE_SYSTEM_AUDIO_DEVICE_ID {
         #[cfg(all(target_os = "macos", feature = "native-system-audio"))]
         {
-            CaptureHandle::Native(native_audio::start(raw_tx).map_err(|e| e.to_string())?)
+            match native_audio::start(raw_tx) {
+                Ok(handle) => CaptureHandle::Native(handle),
+                Err(err) => {
+                    if let Some(path) = &log_path {
+                        debuglog::log(path, &format!("native_audio::start failed: {err}"));
+                    }
+                    return Err(err.to_string());
+                }
+            }
         }
         #[cfg(not(all(target_os = "macos", feature = "native-system-audio")))]
         {
             return Err("Native system audio capture is only available on macOS 13+.".to_string());
         }
     } else {
-        CaptureHandle::Loopback(audio::start(&device, raw_tx).map_err(|e| e.to_string())?)
+        match audio::start(&device, raw_tx) {
+            Ok(handle) => {
+                if let Some(path) = &log_path {
+                    debuglog::log(path, "audio::start: stream opened successfully");
+                }
+                CaptureHandle::Loopback(handle)
+            }
+            Err(err) => {
+                if let Some(path) = &log_path {
+                    debuglog::log(path, &format!("audio::start failed: {err}"));
+                }
+                return Err(err.to_string());
+            }
+        }
     };
 
     let (audio_tx, audio_rx) = mpsc::channel::<audio::CaptureMessage>(64);
+    let bridge_log_path = log_path.clone();
     std::thread::spawn(move || {
         // Bridge the realtime thread to async without blocking either.
+        // The first-message and periodic logs exist to answer one question
+        // when capture silently produces nothing downstream: did the
+        // realtime callback ever fire at all, or did it fire and something
+        // past this point drop it.
+        let mut received: u64 = 0;
         while let Ok(message) = raw_rx.recv() {
+            received += 1;
+            if let Some(path) = &bridge_log_path {
+                if received == 1 {
+                    debuglog::log(
+                        path,
+                        "bridge: first audio message received from capture thread",
+                    );
+                } else if received % 500 == 0 {
+                    debuglog::log(path, &format!("bridge: {received} messages relayed so far"));
+                }
+            }
             if audio_tx.blocking_send(message).is_err() {
+                if let Some(path) = &bridge_log_path {
+                    debuglog::log(path, "bridge: session receiver dropped, stopping");
+                }
                 break;
+            }
+        }
+        if received == 0 {
+            if let Some(path) = &bridge_log_path {
+                debuglog::log(
+                    path,
+                    "bridge: capture thread ended with ZERO messages ever received",
+                );
             }
         }
     });
@@ -242,9 +297,13 @@ async fn start_listening(
             .unwrap_or_default()
     );
     let handle = app.clone();
+    let session_log_path = log_path.clone();
     tokio::spawn(async move {
         if let Err(err) = session::run_session(handle.clone(), settings, audio_rx, stop_rx).await {
             eprintln!("session ended: {err}");
+            if let Some(path) = &session_log_path {
+                debuglog::log(path, &format!("run_session ended with error: {err}"));
+            }
             let _ = handle.emit(
                 "verity://event",
                 session::ServerEvent {
@@ -410,6 +469,8 @@ fn main() {
 
             let config_dir = app.path().app_config_dir()?;
             let preferences_path = preferences::path(&config_dir);
+            let debug_log_path = debuglog::path(&config_dir);
+            debuglog::log(&debug_log_path, "--- app launched ---");
             let mut saved = preferences::load(&preferences_path);
             if saved.groq_api_keys.is_empty() && !saved.groq_api_key.is_empty() {
                 saved.groq_api_keys.push(saved.groq_api_key.clone());
@@ -430,6 +491,7 @@ fn main() {
             let state = app.state::<AppState>();
             *state.preferences_path.lock().unwrap() = Some(preferences_path);
             *state.preferences.lock().unwrap() = saved.clone();
+            *state.debug_log_path.lock().unwrap() = Some(debug_log_path);
 
             if let Some(window) = app.get_webview_window("main") {
                 window.set_always_on_top(true)?;
