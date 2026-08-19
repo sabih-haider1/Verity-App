@@ -1,0 +1,20 @@
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Packaged builds (produced by `cargo tauri build`)
+*.dmg
+*.msi
+*.exe
+*.AppImage
+
+# OS
+.DS_Store
+*.log
