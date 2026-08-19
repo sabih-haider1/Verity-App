@@ -15,19 +15,21 @@ env:
 jobs:
   lint:
     name: Format and lint
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: clippy has to compile Tauri's own dependency tree to
+    # get type information even with --no-deps, and that tree needs
+    # GTK/WebKit system libraries Linux does not have preinstalled. Windows
+    # already carries everything the other jobs need, so lint rides along
+    # there for free instead of installing a second toolchain.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt clippy
       - name: Check formatting
         working-directory: src-tauri
         run: cargo fmt --check
-      # Only the parts that do not need the Tauri system libraries, so this
-      # job stays fast and does not pull in GTK/WebKit on Linux.
       - name: Clippy
         working-directory: src-tauri
-        run: cargo clippy --no-deps -- -D warnings
-        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Tests (${{ matrix.os }})

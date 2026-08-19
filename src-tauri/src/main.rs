@@ -117,6 +117,10 @@ async fn get_desktop_settings(state: State<'_, AppState>) -> Result<DesktopSetti
     Ok(DesktopSettings::from(&*saved))
 }
 
+// A Tauri command's parameters are exactly its JS-facing API: each one is a
+// field the frontend's invoke() call names directly, so bundling them into a
+// struct would only relocate the count into the frontend's call site too.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn save_desktop_settings(
     state: State<'_, AppState>,

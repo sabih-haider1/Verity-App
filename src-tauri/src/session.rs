@@ -378,6 +378,10 @@ async fn transcribe(
     Err(anyhow!(last_error))
 }
 
+// Each parameter is a distinct, already-borrowed piece of session state;
+// bundling them into a struct would just move the same count into one more
+// place without changing what the caller has to assemble.
+#[allow(clippy::too_many_arguments)]
 async fn stream_answer(
     app: &tauri::AppHandle,
     client: &reqwest::Client,
