@@ -118,6 +118,21 @@ VERITY_GROQ_API_KEY=gsk_... cargo run --release
 
 ## Building the installer
 
+### Easiest: let GitHub build it
+
+You do not need a toolchain at all. This repo has a workflow that builds on
+real Windows and macOS machines:
+
+1. Open the **Actions** tab → **Build** → **Run workflow** (it also runs on
+   every push to `main`).
+2. When it finishes, open the run and download from **Artifacts**:
+   - `verity-windows` — the `.exe` installer and `.msi`
+   - `verity-macos` — the `.dmg`
+
+Artifacts are zipped by GitHub, so unzip before running the installer.
+
+### Building locally
+
 Build on the OS you are targeting — Tauri does not cross-compile the installer,
 because each platform's bundler needs that platform's own tooling.
 
