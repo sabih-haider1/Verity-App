@@ -60,10 +60,12 @@ jobs:
             paths: |
               src-tauri/target/release/bundle/nsis/*.exe
               src-tauri/target/release/bundle/msi/*.msi
+              dist-probe/*
           - os: macos-latest
             artifact: verity-macos
             paths: |
               src-tauri/target/release/bundle/dmg/*.dmg
+              dist-probe/*
     steps:
       - uses: actions/checkout@v4
 
@@ -83,6 +85,19 @@ jobs:
       - name: Build installer
         working-directory: src-tauri
         run: cargo tauri build
+
+
+      - name: Build audio probe
+        run: cargo build --release --manifest-path audio-probe/Cargo.toml
+
+      - name: Stage probe next to the installers
+        shell: bash
+        run: |
+          mkdir -p dist-probe
+          # Only the executable: the sibling .d and .pdb files are build debris.
+          cp audio-probe/target/release/audio-probe.exe dist-probe/ 2>/dev/null \
+            || cp audio-probe/target/release/audio-probe dist-probe/
+          ls -l dist-probe
 
       - name: List what was bundled
         shell: bash

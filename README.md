@@ -63,6 +63,36 @@ Nothing to install. Windows exposes every output device as a capture source, so
 Verity lists your speakers/headphones directly — pick the one the call plays
 through (it is preselected) and you are done. Headphones work fine.
 
+---
+
+## When nothing is being transcribed
+
+Every capture failure looks the same from the HUD: it sits there and no
+question appears. `audio-probe` tells you which half is broken, with no API key
+and no network.
+
+It ships in the same CI artifact as the installer (`audio-probe.exe` on
+Windows), or build it yourself:
+
+```bash
+cargo run --release --manifest-path audio-probe/Cargo.toml
+```
+
+```
+audio-probe            # capture the default output device (system audio)
+audio-probe --list     # just enumerate what this machine exposes
+audio-probe 3          # capture device 3 from that list
+```
+
+Play the interviewer's audio while it runs and read the meter:
+
+| What you see | What it means |
+|---|---|
+| **RMS moves, "capture WORKS"** | The machine is fine. Select that exact device in Verity — if it still fails there, the bug is above capture, not in it. |
+| **"opened but delivered SILENCE"** | The device opened but carries no audio. The call is almost certainly playing through a *different* device — re-run against the other numbers, especially your headphones. |
+| **"could not capture this device"** | That endpoint cannot be opened at all. Try another number from the list. |
+| **No devices listed** | Windows sees no sound hardware. |
+
 ### macOS 13+
 
 Apple's ScreenCaptureKit taps system audio with no virtual device. It needs
