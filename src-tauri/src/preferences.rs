@@ -70,12 +70,12 @@ pub fn save(path: &Path, preferences: &Preferences) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// `name` is already unique per test, so it alone separates the parallel
+    /// cases. Deliberately not the thread name: the test harness names threads
+    /// after the test path (`preferences::tests::…`), and `:` is not a legal
+    /// character in a Windows filename.
     fn test_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "verity-{name}-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
-        ))
+        std::env::temp_dir().join(format!("verity-{name}-{}.json", std::process::id()))
     }
 
     #[test]
