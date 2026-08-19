@@ -17,8 +17,13 @@ use tokio::sync::mpsc;
 const SILENCE_FLUSH_MS: u64 = 360;
 const MIN_VOICE_MS: u64 = 300;
 const MAX_UTTERANCE_MS: u64 = 10_000;
-const VOICE_RMS_THRESHOLD: f32 = 0.012;
-/// How long a stretch of pure silence (nothing crossing `VOICE_RMS_THRESHOLD`)
+/// Fallback only, used until calibration below produces a real number:
+/// captured loopback level varies hugely by OS and sound driver (a Realtek
+/// Windows loopback measured an order of magnitude quieter here than the
+/// value this was tuned against), so a fixed threshold is wrong on some
+/// machine no matter what it is set to.
+const FALLBACK_VOICE_RMS_THRESHOLD: f32 = 0.012;
+/// How long a stretch of pure silence (nothing crossing the voice threshold)
 /// can run before the HUD is told, instead of continuing to claim "Audio is
 /// active" while nothing is actually reaching the pipeline — e.g. the wrong
 /// device is selected, or interview audio isn't routed to it.
@@ -26,9 +31,26 @@ const NO_VOICE_ALERT_MS: u64 = 12_000;
 /// How often the live level meter updates. Frequent enough to feel
 /// real-time, far below IPC-flooding territory.
 const LEVEL_EMIT_MS: u64 = 150;
-/// RMS treated as "full scale" for the HUD meter. Comfortably above normal
-/// speech (~0.02-0.05) so the bar has headroom before clipping visually.
-const LEVEL_REFERENCE_RMS: f32 = 0.15;
+/// How long to sample the incoming stream before committing to a voice
+/// threshold. Long enough to see past one lucky quiet or loud chunk, short
+/// enough that a real interview question inside this window is still caught
+/// by the fallback threshold rather than missed outright.
+const CALIBRATION_MS: u64 = 1_500;
+/// The calibrated threshold is a multiple of the measured noise floor, not
+/// the floor itself — otherwise room hiss alone would count as speech. 4x is
+/// comfortably above measurement jitter while still well under normal speech,
+/// which runs 10-50x the floor on a quiet mic.
+const THRESHOLD_ABOVE_FLOOR: f32 = 4.0;
+/// Bounds on the calibrated threshold so a pathological calibration window —
+/// dead silence, or someone talking through the whole first second — cannot
+/// produce a threshold that is unreachable or that fires on room noise.
+const MIN_VOICE_RMS_THRESHOLD: f32 = 0.003;
+const MAX_VOICE_RMS_THRESHOLD: f32 = 0.05;
+/// The HUD meter's "full scale" also has to move with device loudness, or a
+/// quiet device correctly detecting speech would still show a bar stuck near
+/// zero. Set as a multiple of the calibrated voice threshold so normal speech
+/// reads as a mid-to-high bar with headroom before clipping.
+const LEVEL_REFERENCE_ABOVE_THRESHOLD: f32 = 6.0;
 const STT_MODEL: &str = "whisper-large-v3-turbo";
 // Measured against the live Groq API: openai/gpt-oss-20b's time-to-first-
 // token ranged 300ms-1.3s+ (occasionally 500-erroring) across otherwise
@@ -161,6 +183,16 @@ pub async fn run_session(
     let mut device_error = None;
     let mut silence_since_voice_ms = 0_u64;
     let mut elapsed_ms = 0_u64;
+    // Calibration replaces a fixed voice threshold with one measured against
+    // this device: loopback level varies by an order of magnitude across OS
+    // and sound driver, so no single constant is right on every machine. The
+    // fallback threshold covers the calibration window itself so an early
+    // question is still caught rather than missed outright.
+    let mut calibration_samples: Vec<f32> = Vec::new();
+    let mut calibration_ms_elapsed = 0_u64;
+    let mut calibrated = false;
+    let mut voice_threshold = FALLBACK_VOICE_RMS_THRESHOLD;
+    let mut level_reference = FALLBACK_VOICE_RMS_THRESHOLD * LEVEL_REFERENCE_ABOVE_THRESHOLD;
     // Coarser than the HUD meter's own throttle: the debug log exists to be
     // read after the fact, so it summarizes a whole window instead of
     // recording every emit. The number that actually answers "is real audio
@@ -182,7 +214,28 @@ pub async fn run_session(
                 };
                 let duration_ms = pcm_duration_ms(&pcm);
                 let rms = frame_rms(&pcm);
-                let voiced = rms >= VOICE_RMS_THRESHOLD;
+
+                if !calibrated {
+                    calibration_samples.push(rms);
+                    calibration_ms_elapsed += duration_ms;
+                    if calibration_ms_elapsed >= CALIBRATION_MS {
+                        voice_threshold = calibrate_threshold(&calibration_samples);
+                        level_reference = voice_threshold * LEVEL_REFERENCE_ABOVE_THRESHOLD;
+                        calibrated = true;
+                        if let Some(path) = &log_path {
+                            let sample_count = calibration_samples.len();
+                            super::debuglog::log(
+                                path,
+                                &format!(
+                                    "calibrated from {sample_count} samples: voice_threshold={voice_threshold:.4}, level_reference={level_reference:.4}"
+                                ),
+                            );
+                        }
+                        calibration_samples.clear();
+                        calibration_samples.shrink_to_fit();
+                    }
+                }
+                let voiced = rms >= voice_threshold;
 
                 log_window_ms += duration_ms;
                 log_window_peak_rms = log_window_peak_rms.max(rms);
@@ -191,7 +244,7 @@ pub async fn run_session(
                         super::debuglog::log(
                             path,
                             &format!(
-                                "level: peak_rms={log_window_peak_rms:.4} (threshold={VOICE_RMS_THRESHOLD}) over last {log_window_ms}ms"
+                                "level: peak_rms={log_window_peak_rms:.4} (threshold={voice_threshold:.4}, calibrated={calibrated}) over last {log_window_ms}ms"
                             ),
                         );
                     }
@@ -233,7 +286,7 @@ pub async fn run_session(
                         &app,
                         "audio.level",
                         json!({
-                            "level": (rms / LEVEL_REFERENCE_RMS).min(1.0),
+                            "level": (rms / level_reference).min(1.0),
                             "voiced": voiced
                         }),
                     );
@@ -623,6 +676,26 @@ fn frame_rms(pcm: &[u8]) -> f32 {
     }
 }
 
+/// Turn a window of measured RMS samples into a voice threshold for this
+/// device: the mean of the quietest quarter, scaled above the floor and
+/// clamped to a sane range.
+///
+/// The quietest quarter rather than the mean of the whole window, because
+/// speech has pauses even when someone talks through the entire calibration
+/// window — the low samples during those pauses are the true noise floor,
+/// and the loud samples in between would drag a plain mean up toward a
+/// threshold real speech might not clear.
+fn calibrate_threshold(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return FALLBACK_VOICE_RMS_THRESHOLD;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let quarter = (sorted.len() / 4).max(1);
+    let floor = sorted[..quarter].iter().sum::<f32>() / quarter as f32;
+    (floor * THRESHOLD_ABOVE_FLOOR).clamp(MIN_VOICE_RMS_THRESHOLD, MAX_VOICE_RMS_THRESHOLD)
+}
+
 fn wav_bytes(pcm: &[u8]) -> Vec<u8> {
     let mut wav = Vec::with_capacity(44 + pcm.len());
     wav.extend_from_slice(b"RIFF");
@@ -691,6 +764,42 @@ mod tests {
     #[test]
     fn silence_has_zero_rms() {
         assert_eq!(frame_rms(&[0; 320]), 0.0);
+    }
+
+    #[test]
+    fn calibration_tracks_a_quiet_device_instead_of_the_fixed_default() {
+        // A Windows loopback device roughly an order of magnitude quieter
+        // than the value the fallback was tuned against.
+        let quiet_noise_floor: Vec<f32> = vec![0.0008, 0.0009, 0.0007, 0.0010, 0.0006];
+        let threshold = calibrate_threshold(&quiet_noise_floor);
+        assert!(
+            threshold < FALLBACK_VOICE_RMS_THRESHOLD,
+            "a device this quiet must calibrate below the fixed fallback, got {threshold}"
+        );
+        assert!(threshold >= MIN_VOICE_RMS_THRESHOLD);
+    }
+
+    #[test]
+    fn calibration_ignores_loud_samples_mixed_into_the_window() {
+        // Someone talking through part of the calibration window: the loud
+        // samples must not drag the floor estimate up with them.
+        let mixed: Vec<f32> = vec![0.001, 0.0009, 0.15, 0.18, 0.001, 0.0011, 0.2, 0.001];
+        let threshold = calibrate_threshold(&mixed);
+        assert!(
+            threshold < 0.01,
+            "loud transients in the window should not raise the floor estimate, got {threshold}"
+        );
+    }
+
+    #[test]
+    fn calibration_never_exceeds_the_configured_bounds() {
+        assert!(calibrate_threshold(&[0.0; 10]) >= MIN_VOICE_RMS_THRESHOLD);
+        assert!(calibrate_threshold(&[1.0; 10]) <= MAX_VOICE_RMS_THRESHOLD);
+    }
+
+    #[test]
+    fn calibration_falls_back_with_no_samples() {
+        assert_eq!(calibrate_threshold(&[]), FALLBACK_VOICE_RMS_THRESHOLD);
     }
 
     #[test]
