@@ -124,6 +124,7 @@ pub async fn run_session(
     settings: Settings,
     mut audio: mpsc::Receiver<super::audio::CaptureMessage>,
     mut stop: mpsc::Receiver<()>,
+    log_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .tcp_nodelay(true)
@@ -160,6 +161,14 @@ pub async fn run_session(
     let mut device_error = None;
     let mut silence_since_voice_ms = 0_u64;
     let mut elapsed_ms = 0_u64;
+    // Coarser than the HUD meter's own throttle: the debug log exists to be
+    // read after the fact, so it summarizes a whole window instead of
+    // recording every emit. The number that actually answers "is real audio
+    // arriving" is the peak, since RMS on a mixed chunk can look quiet even
+    // while speech is present elsewhere in the window.
+    let mut log_window_ms = 0_u64;
+    let mut log_window_peak_rms = 0_f32;
+    const LOG_WINDOW_MS: u64 = 2_000;
 
     loop {
         tokio::select! {
@@ -175,6 +184,21 @@ pub async fn run_session(
                 let rms = frame_rms(&pcm);
                 let voiced = rms >= VOICE_RMS_THRESHOLD;
 
+                log_window_ms += duration_ms;
+                log_window_peak_rms = log_window_peak_rms.max(rms);
+                if log_window_ms >= LOG_WINDOW_MS {
+                    if let Some(path) = &log_path {
+                        super::debuglog::log(
+                            path,
+                            &format!(
+                                "level: peak_rms={log_window_peak_rms:.4} (threshold={VOICE_RMS_THRESHOLD}) over last {log_window_ms}ms"
+                            ),
+                        );
+                    }
+                    log_window_ms = 0;
+                    log_window_peak_rms = 0.0;
+                }
+
                 // Independent of utterance segmentation below: tell the HUD
                 // the truth about whether anything voiced has reached the
                 // pipeline recently, instead of leaving a static "Audio is
@@ -185,6 +209,12 @@ pub async fn run_session(
                     let before = silence_since_voice_ms;
                     silence_since_voice_ms += duration_ms;
                     if crosses_interval(before, silence_since_voice_ms, NO_VOICE_ALERT_MS) {
+                        if let Some(path) = &log_path {
+                            super::debuglog::log(
+                                path,
+                                &format!("audio.silence fired: {silence_since_voice_ms}ms with nothing crossing the voice threshold"),
+                            );
+                        }
                         emit(
                             &app,
                             "audio.silence",

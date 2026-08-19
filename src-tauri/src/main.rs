@@ -303,7 +303,15 @@ async fn start_listening(
     let handle = app.clone();
     let session_log_path = log_path.clone();
     tokio::spawn(async move {
-        if let Err(err) = session::run_session(handle.clone(), settings, audio_rx, stop_rx).await {
+        if let Err(err) = session::run_session(
+            handle.clone(),
+            settings,
+            audio_rx,
+            stop_rx,
+            session_log_path.clone(),
+        )
+        .await
+        {
             eprintln!("session ended: {err}");
             if let Some(path) = &session_log_path {
                 debuglog::log(path, &format!("run_session ended with error: {err}"));
