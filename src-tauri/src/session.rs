@@ -72,6 +72,22 @@ pub struct Settings {
     pub job_description: String,
     pub language: String,
     pub chat_model: String,
+    pub chat_provider: ChatProvider,
+    pub chat_api_keys: Vec<String>,
+}
+
+impl Settings {
+    /// The keys that actually answer the question: Groq reuses the
+    /// transcription keys already entered, since duplicating them into a
+    /// second field would only ask the same thing twice for the one
+    /// provider where the answer is always the same list.
+    fn effective_chat_keys(&self) -> &[String] {
+        if self.chat_provider == ChatProvider::Groq {
+            &self.api_keys
+        } else {
+            &self.chat_api_keys
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +135,128 @@ pub async fn test_api_keys(api_keys: &[String]) -> Result<ApiTestResult> {
                 );
             }
             Err(error) => last_error = format!("Groq key {} network error: {error}", index + 1),
+        }
+    }
+    Err(anyhow!(last_error))
+}
+
+/// Which service generates the spoken answer. Transcription always stays on
+/// Groq Whisper regardless of this choice: Anthropic has no audio
+/// transcription endpoint at all, and Gemini's audio input is a different
+/// request shape than a Whisper-style transcribe call, so only answer
+/// generation is genuinely interchangeable across all four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatProvider {
+    Groq,
+    OpenAi,
+    Anthropic,
+    Gemini,
+}
+
+impl ChatProvider {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" => Self::OpenAi,
+            "anthropic" | "claude" => Self::Anthropic,
+            "gemini" | "google" => Self::Gemini,
+            _ => Self::Groq,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Groq => "groq",
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Groq => "Groq",
+            Self::OpenAi => "OpenAI",
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Gemini",
+        }
+    }
+
+    fn default_model(self) -> &'static str {
+        match self {
+            Self::Groq => DEFAULT_CHAT_MODEL,
+            Self::OpenAi => "gpt-4o-mini",
+            // Current per the model roster this build shipped against, not
+            // the older 3.5 Haiku line - keep in sync if that roster moves.
+            Self::Anthropic => "claude-haiku-4-5-20251001",
+            Self::Gemini => "gemini-2.0-flash",
+        }
+    }
+
+    /// A cheap, unauthenticated-safe endpoint used only to prove the key and
+    /// network path work, with no generation cost.
+    fn models_request(self, client: &reqwest::Client, api_key: &str) -> reqwest::RequestBuilder {
+        match self {
+            Self::Groq => client
+                .get("https://api.groq.com/openai/v1/models")
+                .bearer_auth(api_key),
+            Self::OpenAi => client
+                .get("https://api.openai.com/v1/models")
+                .bearer_auth(api_key),
+            Self::Anthropic => client
+                .get("https://api.anthropic.com/v1/models")
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01"),
+            Self::Gemini => client
+                .get("https://generativelanguage.googleapis.com/v1beta/models")
+                .query(&[("key", api_key)]),
+        }
+    }
+}
+
+pub async fn test_provider_keys(
+    provider: ChatProvider,
+    api_keys: &[String],
+) -> Result<ApiTestResult> {
+    if provider == ChatProvider::Groq {
+        return test_api_keys(api_keys).await;
+    }
+    if api_keys.is_empty() {
+        return Err(anyhow!("Add at least one {} API key.", provider.label()));
+    }
+    let client = reqwest::Client::builder().tcp_nodelay(true).build()?;
+    let started = Instant::now();
+    let mut last_error = format!("No {} API key could connect.", provider.label());
+    for (index, api_key) in api_keys.iter().enumerate() {
+        match provider
+            .models_request(&client, api_key)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                return Ok(ApiTestResult {
+                    working_key: index + 1,
+                    total_keys: api_keys.len(),
+                    latency_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+            Ok(response) => {
+                let status = response.status();
+                let detail = response.text().await.unwrap_or_default();
+                last_error = format!(
+                    "{} key {} failed ({status}): {}",
+                    provider.label(),
+                    index + 1,
+                    concise_error(&detail)
+                );
+            }
+            Err(error) => {
+                last_error = format!(
+                    "{} key {} network error: {error}",
+                    provider.label(),
+                    index + 1
+                )
+            }
         }
     }
     Err(anyhow!(last_error))
@@ -469,6 +607,93 @@ fn is_reasoning_model(model: &str) -> bool {
     model.starts_with("openai/gpt-oss")
 }
 
+/// Builds the one outbound HTTP request for `provider`. The prompt already
+/// contains every instruction — role, resume, job description, question —
+/// as a single block of text, so every provider accepts it unchanged as one
+/// user message; only the transport (URL, auth, body shape, streaming
+/// format) actually differs between them.
+fn build_chat_request(
+    client: &reqwest::Client,
+    provider: ChatProvider,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> reqwest::RequestBuilder {
+    match provider {
+        ChatProvider::Groq | ChatProvider::OpenAi => {
+            let mut body = json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": prompt }],
+                "stream": true,
+                "temperature": 0.3,
+                "max_completion_tokens": 160
+            });
+            // reasoning_effort/include_reasoning are Groq extensions only
+            // the gpt-oss family accepts — every other model, including
+            // OpenAI's, 400s outright if they're present.
+            if provider == ChatProvider::Groq && is_reasoning_model(model) {
+                let object = body.as_object_mut().expect("object literal");
+                object.insert("reasoning_effort".to_string(), json!("low"));
+                object.insert("include_reasoning".to_string(), json!(false));
+            }
+            let url = match provider {
+                ChatProvider::Groq => "https://api.groq.com/openai/v1/chat/completions",
+                _ => "https://api.openai.com/v1/chat/completions",
+            };
+            client.post(url).bearer_auth(api_key).json(&body)
+        }
+        ChatProvider::Anthropic => {
+            let body = json!({
+                "model": model,
+                "max_tokens": 160,
+                "temperature": 0.3,
+                "stream": true,
+                "messages": [{ "role": "user", "content": prompt }]
+            });
+            client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+        }
+        ChatProvider::Gemini => {
+            let body = json!({
+                "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
+                "generationConfig": { "temperature": 0.3, "maxOutputTokens": 160 }
+            });
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent"
+            );
+            client
+                .post(url)
+                .query(&[("alt", "sse"), ("key", api_key)])
+                .json(&body)
+        }
+    }
+}
+
+/// Pulls the incremental answer text out of one already-parsed SSE data
+/// line, whose JSON shape is different for every provider. Returns `None`
+/// for event types that carry no text (Anthropic's `message_start`,
+/// `content_block_stop`, pings, and so on) so the caller's loop just moves
+/// on to the next line instead of treating it as an empty answer chunk.
+fn extract_delta_text(provider: ChatProvider, value: &serde_json::Value) -> Option<String> {
+    match provider {
+        ChatProvider::Groq | ChatProvider::OpenAi => value["choices"][0]["delta"]["content"]
+            .as_str()
+            .map(str::to_string),
+        ChatProvider::Anthropic => {
+            if value.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
+                return None;
+            }
+            value["delta"]["text"].as_str().map(str::to_string)
+        }
+        ChatProvider::Gemini => value["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .map(str::to_string),
+    }
+}
+
 // Each parameter is a distinct, already-borrowed piece of session state;
 // bundling them into a struct would just move the same count into one more
 // place without changing what the caller has to assemble.
@@ -507,43 +732,35 @@ async fn stream_answer(
          If the question refers back to something earlier (e.g. \"the hardest part\", \"that project\"), resolve it using the recent conversation below.\n\n\
          RESUME CONTEXT:\n{resume}\n\nJOB DESCRIPTION:\n{job_description}\n\nRECENT CONVERSATION:\n{conversation}\n\nINTERVIEWER QUESTION:\n{question}"
     );
+    let provider = settings.chat_provider;
     let model = if settings.chat_model.trim().is_empty() {
-        DEFAULT_CHAT_MODEL
+        provider.default_model()
     } else {
         settings.chat_model.trim()
     };
-    let mut request_body = json!({
-        "model": model,
-        "messages": [{ "role": "user", "content": prompt }],
-        "stream": true,
-        "temperature": 0.3,
-        "max_completion_tokens": 160
-    });
-    // reasoning_effort/include_reasoning are Groq extensions only the
-    // gpt-oss family accepts — every other model, including the default,
-    // 400s outright if they're present. chat_model is user-overridable to
-    // any Groq model, so this has to be a runtime check, not just whatever
-    // the currently-configured default happens to need.
-    if is_reasoning_model(model) {
-        let body = request_body.as_object_mut().expect("object literal");
-        body.insert("reasoning_effort".to_string(), json!("low"));
-        body.insert("include_reasoning".to_string(), json!(false));
+    let keys = settings.effective_chat_keys();
+    if keys.is_empty() {
+        return Err(anyhow!(
+            "Add at least one {} API key before starting.",
+            provider.label()
+        ));
     }
     let mut response = None;
-    let mut last_error = "Groq answer failed.".to_string();
-    for offset in 0..settings.api_keys.len() {
-        let index = (preferred_key_index + offset) % settings.api_keys.len();
-        let result = client
-            .post("https://api.groq.com/openai/v1/chat/completions")
-            .bearer_auth(&settings.api_keys[index])
-            .json(&request_body)
+    let mut last_error = format!("{} answer failed.", provider.label());
+    for offset in 0..keys.len() {
+        let index = (preferred_key_index + offset) % keys.len();
+        let result = build_chat_request(client, provider, &keys[index], model, &prompt)
             .timeout(std::time::Duration::from_secs(12))
             .send()
             .await;
         let candidate = match result {
             Ok(candidate) => candidate,
             Err(error) => {
-                last_error = format!("Groq key {} network error: {error}", index + 1);
+                last_error = format!(
+                    "{} key {} network error: {error}",
+                    provider.label(),
+                    index + 1
+                );
                 continue;
             }
         };
@@ -554,7 +771,8 @@ async fn stream_answer(
         let status = candidate.status();
         let detail = candidate.text().await.unwrap_or_default();
         last_error = format!(
-            "Groq key {} answer failed ({status}): {}",
+            "{} key {} answer failed ({status}): {}",
+            provider.label(),
             index + 1,
             concise_error(&detail)
         );
@@ -576,19 +794,22 @@ async fn stream_answer(
             let Some(data) = line.strip_prefix("data: ") else {
                 continue;
             };
+            // Only Groq/OpenAI send this literal sentinel; Anthropic and
+            // Gemini simply close the connection when done, so this check
+            // is a no-op rather than a special case for those two.
             if data == "[DONE]" {
                 break;
             }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
-            let delta = value["choices"][0]["delta"]["content"]
-                .as_str()
-                .unwrap_or_default();
+            let Some(delta) = extract_delta_text(provider, &value) else {
+                continue;
+            };
             if delta.is_empty() {
                 continue;
             }
-            answer.push_str(delta);
+            answer.push_str(&delta);
             let first = *first_token_ms
                 .get_or_insert_with(|| detection_delay_ms + queued_at.elapsed().as_millis() as u64);
             emit(
@@ -828,6 +1049,130 @@ mod tests {
         assert!(is_reasoning_model("openai/gpt-oss-20b"));
         assert!(is_reasoning_model("openai/gpt-oss-120b"));
         assert!(is_reasoning_model("openai/gpt-oss-safeguard-20b"));
+    }
+
+    #[test]
+    fn provider_parse_round_trips_through_as_str_and_falls_back_to_groq() {
+        for provider in [
+            ChatProvider::Groq,
+            ChatProvider::OpenAi,
+            ChatProvider::Anthropic,
+            ChatProvider::Gemini,
+        ] {
+            assert_eq!(ChatProvider::parse(provider.as_str()), provider);
+        }
+        // Aliases a user might reasonably type.
+        assert_eq!(ChatProvider::parse("Claude"), ChatProvider::Anthropic);
+        assert_eq!(ChatProvider::parse("GOOGLE"), ChatProvider::Gemini);
+        // An unrecognized or empty value must not silently pick a paid
+        // provider the user never selected.
+        assert_eq!(ChatProvider::parse(""), ChatProvider::Groq);
+        assert_eq!(ChatProvider::parse("made-up-provider"), ChatProvider::Groq);
+    }
+
+    #[test]
+    fn every_provider_has_a_distinct_nonempty_default_model() {
+        let providers = [
+            ChatProvider::Groq,
+            ChatProvider::OpenAi,
+            ChatProvider::Anthropic,
+            ChatProvider::Gemini,
+        ];
+        let models: Vec<&str> = providers.iter().map(|p| p.default_model()).collect();
+        assert!(models.iter().all(|m| !m.is_empty()));
+        let mut unique = models.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            models.len(),
+            "default models must be distinct: {models:?}"
+        );
+    }
+
+    #[test]
+    fn extract_delta_text_reads_the_openai_compatible_shape() {
+        let chunk = serde_json::json!({
+            "choices": [{ "delta": { "content": "Hello" } }]
+        });
+        assert_eq!(
+            extract_delta_text(ChatProvider::Groq, &chunk),
+            Some("Hello".to_string())
+        );
+        assert_eq!(
+            extract_delta_text(ChatProvider::OpenAi, &chunk),
+            Some("Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_delta_text_reads_anthropic_content_block_delta_only() {
+        let text_chunk = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": { "type": "text_delta", "text": "Hello" }
+        });
+        assert_eq!(
+            extract_delta_text(ChatProvider::Anthropic, &text_chunk),
+            Some("Hello".to_string())
+        );
+        // message_start, content_block_start, ping, message_stop and friends
+        // carry no answer text — treating them as an empty delta instead of
+        // skipping them would still work, but None makes the "no text here"
+        // case explicit rather than accidental.
+        let message_start = serde_json::json!({ "type": "message_start" });
+        assert_eq!(
+            extract_delta_text(ChatProvider::Anthropic, &message_start),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_delta_text_reads_the_gemini_candidates_shape() {
+        let chunk = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "Hello" }] } }]
+        });
+        assert_eq!(
+            extract_delta_text(ChatProvider::Gemini, &chunk),
+            Some("Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_delta_text_returns_none_on_an_unrecognized_shape_instead_of_panicking() {
+        let empty = serde_json::json!({});
+        for provider in [
+            ChatProvider::Groq,
+            ChatProvider::OpenAi,
+            ChatProvider::Anthropic,
+            ChatProvider::Gemini,
+        ] {
+            assert_eq!(extract_delta_text(provider, &empty), None);
+        }
+    }
+
+    #[test]
+    fn groq_provider_reuses_transcription_keys_but_other_providers_need_their_own() {
+        let mut settings = Settings {
+            api_keys: vec!["gsk_shared".to_string()],
+            role_title: String::new(),
+            company_name: String::new(),
+            resume_text: String::new(),
+            job_description: String::new(),
+            language: "en".to_string(),
+            chat_model: String::new(),
+            chat_provider: ChatProvider::Groq,
+            chat_api_keys: Vec::new(),
+        };
+        assert_eq!(settings.effective_chat_keys(), &["gsk_shared".to_string()]);
+
+        settings.chat_provider = ChatProvider::Anthropic;
+        assert!(
+            settings.effective_chat_keys().is_empty(),
+            "an unconfigured non-Groq provider must not silently fall back to Groq's keys"
+        );
+
+        settings.chat_api_keys = vec!["sk-ant-real".to_string()];
+        assert_eq!(settings.effective_chat_keys(), &["sk-ant-real".to_string()]);
     }
 
     #[test]

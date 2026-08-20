@@ -4,9 +4,12 @@ A standalone, always-on-top window that listens to a real interview and streams
 an answer you can adapt while you respond. It has no login, signup, Verity web
 account, workspace, database, or backend dependency.
 
-Audio is segmented locally after a short pause, transcribed directly with Groq
-Whisper, and answered through Groq streaming chat. You supply one or more Groq API keys in
-the desktop app or through `VERITY_GROQ_API_KEY`/`GROQ_API_KEY`.
+Audio is segmented locally after a short pause and transcribed directly with
+Groq Whisper — that part always uses Groq. Who writes the suggested answer is
+your choice: Groq, OpenAI, Anthropic (Claude), or Google Gemini, picked in
+Advanced settings. You supply one or more Groq API keys in the desktop app or
+through `VERITY_GROQ_API_KEY`/`GROQ_API_KEY`; a non-Groq answer provider needs
+its own key, entered in the same settings panel.
 
 ---
 
@@ -225,13 +228,34 @@ To sign later, set `APPLE_CERTIFICATE`, `APPLE_ID` and `APPLE_TEAM_ID` and add a
 
 ## Using it in an interview
 
-1. Paste one or more Groq API keys, one per line, and test the connection. They stay in this Mac's local Verity preferences and rotate on auth, rate-limit, or service failures.
+1. Paste one or more Groq API keys, one per line, and test the connection. They stay in this machine's local Verity preferences, rotate on auth/rate-limit/service failures, and always handle transcription regardless of which provider answers.
 2. Add the role/company and paste or import the resume and job description. PDF, TXT, and Markdown are supported.
 3. Choose the interview audio source. A loopback device is recommended.
-4. Press **Start live assistant**, then position the HUD beside your call.
+4. *(Optional)* In **Advanced settings**, pick an **Answer provider** other than Groq — OpenAI, Anthropic, or Gemini — paste that provider's own key(s), and test the connection. Leave it on Groq to reuse the keys from step 1.
+5. Press **Start live assistant**, then position the HUD beside your call.
 
 The window stays above full-screen video calls. **Pinned** toggles that off if
 you need it to behave like a normal window.
+
+### Choosing an answer provider
+
+| Provider | Needs its own key | Default model |
+|---|---|---|
+| Groq | No — reuses the keys above | `allam-2-7b` |
+| OpenAI | Yes | `gpt-4o-mini` |
+| Anthropic (Claude) | Yes | `claude-haiku-4-5-20251001` |
+| Google Gemini | Yes | `gemini-2.0-flash` |
+
+Every provider streams into the same HUD through the same events — switching
+providers changes nothing else about how Verity behaves. The **Answer model**
+field is free text, so any model the selected provider hosts works, not only
+the default.
+
+Requests per detected question: exactly one transcription call and one answer
+call, regardless of provider — plus one extra answer call per API key skipped
+on a retryable failure (rate limit, auth, 5xx). A silent, sub-threshold pause
+never triggers a request at all; segmentation only fires once
+`SILENCE_FLUSH_MS` of quiet follows at least `MIN_VOICE_MS` of real speech.
 
 ### Screen-capture protection
 

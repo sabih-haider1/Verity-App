@@ -7,13 +7,49 @@ const $ = (id) => document.getElementById(id);
 let captureProtectionEnabled = true;
 let devices = [];
 
+function parseKeys(textareaId) {
+  return [...new Set($(textareaId).value.split(/[\n,]+/).map((key) => key.trim()).filter(Boolean))];
+}
+
 function apiKeys() {
-  return [...new Set($('groq-keys').value.split(/[\n,]+/).map((key) => key.trim()).filter(Boolean))];
+  return parseKeys('groq-keys');
+}
+
+function chatApiKeys() {
+  return parseKeys('chat-api-keys');
 }
 
 function updateKeyHint(message) {
   const count = apiKeys().length;
   $('key-hint').textContent = message || `${count} key${count === 1 ? '' : 's'} saved locally · automatic failover in listed order`;
+}
+
+// A provider other than Groq needs its own key, since Groq's keys only
+// authenticate against Groq's API — reusing this instead of a literal
+// string keeps every place that decides "does this need its own keys" in
+// sync with the one place the provider list itself is defined.
+function chatProviderNeedsOwnKeys() {
+  return $('chat-provider').value !== 'groq';
+}
+
+const CHAT_PROVIDER_DEFAULT_MODEL = {
+  groq: 'allam-2-7b',
+  openai: 'gpt-4o-mini',
+  anthropic: 'claude-haiku-4-5-20251001',
+  gemini: 'gemini-2.0-flash',
+};
+
+function updateChatProviderVisibility() {
+  const needsOwnKeys = chatProviderNeedsOwnKeys();
+  $('chat-keys-row').classList.toggle('hidden', !needsOwnKeys);
+  // Only auto-fill when the field still holds a known default (or is
+  // empty) — an explicit override the user typed must never be clobbered
+  // by switching providers back and forth.
+  const current = $('chat-model').value.trim();
+  const isKnownDefault = current === '' || Object.values(CHAT_PROVIDER_DEFAULT_MODEL).includes(current);
+  if (isKnownDefault) {
+    $('chat-model').value = CHAT_PROVIDER_DEFAULT_MODEL[$('chat-provider').value] ?? '';
+  }
 }
 
 function updateContextCounts() {
@@ -68,7 +104,10 @@ async function initialize() {
     $("resume-text").value = settings.resume_text ?? "";
     $("job-description").value = settings.job_description ?? "";
     $("language").value = settings.language || "en";
-    $("chat-model").value = settings.chat_model || "allam-2-7b";
+    $("chat-provider").value = settings.chat_provider || "groq";
+    $("chat-api-keys").value = (settings.chat_api_keys ?? []).join("\n");
+    $("chat-model").value = settings.chat_model || CHAT_PROVIDER_DEFAULT_MODEL[$("chat-provider").value] || "allam-2-7b";
+    updateChatProviderVisibility();
     renderCaptureProtection(settings.protect_hud_from_screen_capture !== false);
     updateKeyHint();
     updateContextCounts();
@@ -103,6 +142,21 @@ async function saveSettings() {
     jobDescription: $("job-description").value.trim(),
     language: $("language").value,
     chatModel: $("chat-model").value.trim(),
+    chatProvider: $("chat-provider").value,
+    chatApiKeys: chatApiKeys(),
+  });
+}
+
+// FileReader's own base64 encoder, not a manual byte-array-over-JSON
+// transfer: a JS number-array of file bytes bloats 3-4x once JSON-encoded
+// for IPC, with no progress feedback while it serialized — for a multi-MB
+// PDF that looked exactly like the import had silently hung.
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.slice(reader.result.indexOf(',') + 1));
+    reader.onerror = () => reject(reader.error ?? new Error('Could not read the file.'));
+    reader.readAsDataURL(file);
   });
 }
 
@@ -110,14 +164,18 @@ async function importDocument(button) {
   const input = $(button.dataset.file);
   const file = input.files?.[0];
   if (!file) throw new Error('Choose a PDF, TXT, or Markdown document first.');
+  const originalLabel = button.textContent;
   button.disabled = true;
   try {
-    const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-    const text = await invoke('extract_document_text', { fileName: file.name, bytes });
+    button.textContent = 'Reading…';
+    const contents = await readFileAsBase64(file);
+    button.textContent = 'Extracting…';
+    const text = await invoke('extract_document_text', { fileName: file.name, contents });
     $(button.dataset.target).value = text;
     updateContextCounts();
   } finally {
     button.disabled = false;
+    button.textContent = originalLabel;
   }
 }
 
@@ -141,6 +199,26 @@ $('test-api-btn').addEventListener('click', async () => {
     await saveSettings();
     const result = await invoke('test_groq_connection');
     updateKeyHint(`Key ${result.working_key} connected in ${result.latency_ms} ms · ${result.total_keys} configured`);
+  } catch (error) {
+    $('setup-error').textContent = String(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$('chat-provider').addEventListener('change', updateChatProviderVisibility);
+
+$('test-chat-btn').addEventListener('click', async () => {
+  const button = $('test-chat-btn');
+  button.disabled = true;
+  $('setup-error').textContent = '';
+  try {
+    const provider = $('chat-provider').value;
+    const keys = chatApiKeys();
+    if (!keys.length) throw new Error('Add at least one API key for the selected provider first.');
+    await saveSettings();
+    const result = await invoke('test_chat_provider', { provider, apiKeys: keys });
+    $('chat-key-hint').textContent = `Key ${result.working_key} connected in ${result.latency_ms} ms · ${result.total_keys} configured`;
   } catch (error) {
     $('setup-error').textContent = String(error);
   } finally {

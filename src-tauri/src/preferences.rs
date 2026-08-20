@@ -24,6 +24,15 @@ pub struct Preferences {
     pub job_description: String,
     pub language: String,
     pub chat_model: String,
+    /// "groq" | "openai" | "anthropic" | "gemini". STT stays on Groq Whisper
+    /// regardless of this — Anthropic has no audio transcription endpoint at
+    /// all, and Gemini's audio input is a different request shape, so only
+    /// answer generation is genuinely provider-agnostic.
+    pub chat_provider: String,
+    /// Used only when `chat_provider` is not "groq"; the Groq keys above
+    /// cover both STT and Groq-provider answers, so a separate key list here
+    /// would just duplicate them for the one case that doesn't need it.
+    pub chat_api_keys: Vec<String>,
     /// Set once the first-launch microphone/screen-recording priming pass
     /// has run, so returning users are never re-prompted by app logic.
     pub permissions_primed: bool,
@@ -41,6 +50,8 @@ impl Default for Preferences {
             job_description: String::new(),
             language: "en".to_string(),
             chat_model: "allam-2-7b".to_string(),
+            chat_provider: "groq".to_string(),
+            chat_api_keys: Vec::new(),
             permissions_primed: false,
         }
     }
@@ -106,6 +117,8 @@ mod tests {
             job_description: "Own backend services.".to_string(),
             language: "en".to_string(),
             chat_model: "openai/gpt-oss-20b".to_string(),
+            chat_provider: "anthropic".to_string(),
+            chat_api_keys: vec!["sk-ant-test".to_string()],
             permissions_primed: true,
         };
         save(&file, &expected).unwrap();

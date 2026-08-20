@@ -74,8 +74,27 @@
             <option value="pt">Portuguese</option>
             <option value="hi">Hindi</option>
           </select>
-          <label for="chat-model">Groq answer model</label>
-          <input id="chat-model" value="allam-2-7b" />
+
+          <label for="chat-provider">Answer provider</label>
+          <select id="chat-provider">
+            <option value="groq">Groq</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="gemini">Google Gemini</option>
+          </select>
+          <p class="hint">Transcription always uses the Groq keys above — Whisper is a Groq-only step. This choice only picks who writes the suggested answer.</p>
+
+          <div id="chat-keys-row" class="hidden">
+            <label for="chat-api-keys">Answer provider API keys</label>
+            <textarea id="chat-api-keys" rows="2" spellcheck="false" placeholder="One API key per line"></textarea>
+            <div class="inline-row">
+              <p id="chat-key-hint" class="hint">Stored only in this machine's local Verity preferences.</p>
+              <button id="test-chat-btn" class="small-button" type="button">Test connection</button>
+            </div>
+          </div>
+
+          <label for="chat-model">Answer model</label>
+          <input id="chat-model" placeholder="Model name for the selected provider" />
         </div>
       </details>
 
