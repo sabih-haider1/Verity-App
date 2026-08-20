@@ -461,6 +461,14 @@ async fn transcribe(
     Err(anyhow!(last_error))
 }
 
+/// Whether `model` accepts Groq's `reasoning_effort`/`include_reasoning`
+/// extensions. Every other Groq-hosted model 400s if they're present, so
+/// this must stay conservative — checking a real prefix, not guessing from a
+/// name that merely mentions "reasoning".
+fn is_reasoning_model(model: &str) -> bool {
+    model.starts_with("openai/gpt-oss")
+}
+
 // Each parameter is a distinct, already-borrowed piece of session state;
 // bundling them into a struct would just move the same count into one more
 // place without changing what the caller has to assemble.
@@ -504,15 +512,23 @@ async fn stream_answer(
     } else {
         settings.chat_model.trim()
     };
-    let request_body = json!({
+    let mut request_body = json!({
         "model": model,
         "messages": [{ "role": "user", "content": prompt }],
         "stream": true,
-        "reasoning_effort": "low",
-        "include_reasoning": false,
         "temperature": 0.3,
         "max_completion_tokens": 160
     });
+    // reasoning_effort/include_reasoning are Groq extensions only the
+    // gpt-oss family accepts — every other model, including the default,
+    // 400s outright if they're present. chat_model is user-overridable to
+    // any Groq model, so this has to be a runtime check, not just whatever
+    // the currently-configured default happens to need.
+    if is_reasoning_model(model) {
+        let body = request_body.as_object_mut().expect("object literal");
+        body.insert("reasoning_effort".to_string(), json!("low"));
+        body.insert("include_reasoning".to_string(), json!(false));
+    }
     let mut response = None;
     let mut last_error = "Groq answer failed.".to_string();
     for offset in 0..settings.api_keys.len() {
@@ -800,6 +816,18 @@ mod tests {
     #[test]
     fn calibration_falls_back_with_no_samples() {
         assert_eq!(calibrate_threshold(&[]), FALLBACK_VOICE_RMS_THRESHOLD);
+    }
+
+    #[test]
+    fn reasoning_params_are_sent_only_to_models_that_accept_them() {
+        // The default and every non-gpt-oss model 400 if these are present —
+        // this is what shipped and broke live replies.
+        assert!(!is_reasoning_model("allam-2-7b"));
+        assert!(!is_reasoning_model("llama-3.3-70b-versatile"));
+        assert!(!is_reasoning_model("qwen/qwen3.6-27b"));
+        assert!(is_reasoning_model("openai/gpt-oss-20b"));
+        assert!(is_reasoning_model("openai/gpt-oss-120b"));
+        assert!(is_reasoning_model("openai/gpt-oss-safeguard-20b"));
     }
 
     #[test]
