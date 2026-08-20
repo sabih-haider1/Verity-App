@@ -553,4 +553,26 @@ mod tests {
             vec!["gsk_one".to_string(), "gsk_two".to_string()]
         );
     }
+
+    /// Guards the bug that made the app look like it had no working audio:
+    /// Tauri v2 grants nothing without a capability file, and the frontend's
+    /// `listen()` is an ACL-gated core-plugin call. Losing this permission
+    /// drops every backend event before the UI sees it, and because the
+    /// rejected promise is invisible in a release webview, nothing reports
+    /// the failure. A missing capability must break the build, not the
+    /// interview.
+    #[test]
+    fn the_ui_is_granted_permission_to_receive_backend_events() {
+        let generated =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("gen/schemas/capabilities.json");
+        let contents = std::fs::read_to_string(&generated).unwrap_or_else(|error| {
+            panic!("could not read {}: {error}", generated.display());
+        });
+
+        assert!(
+            contents.contains("core:default") || contents.contains("core:event"),
+            "no capability grants the event permissions `listen` needs, so the \
+             HUD would receive nothing. Generated ACL was: {contents}"
+        );
+    }
 }

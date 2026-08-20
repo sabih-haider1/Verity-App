@@ -220,7 +220,20 @@ function latencyText(data, complete = false) {
   return "Processing";
 }
 
-listen("verity://event", ({ payload }) => {
+// listen() is a core-plugin IPC call, so it is subject to Tauri's ACL: with
+// no capability granting core:event it rejects, and an uncaught rejection
+// here is invisible — the app looks alive while every backend event is
+// silently dropped. Surface it instead of letting it fail quietly.
+function listenOrReport(event, handler) {
+  listen(event, handler).catch((error) => {
+    const message = `Cannot receive backend events (${event}): ${error}`;
+    const target = $("hud-error") || $("setup-error");
+    if (target) target.textContent = message;
+    console.error(message);
+  });
+}
+
+listenOrReport("verity://event", ({ payload }) => {
   const { kind, payload: data } = payload;
   switch (kind) {
     case "session.ready":
@@ -277,7 +290,7 @@ listen("verity://event", ({ payload }) => {
   }
 });
 
-listen("verity://closed", () => {
+listenOrReport("verity://closed", () => {
   $("dot").classList.remove("live");
   // A user-initiated Stop already navigated back to setup. Reaching here
   // while the HUD is still visible means the session ended on its own
