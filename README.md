@@ -150,6 +150,27 @@ failure, then open that file — the last few lines say exactly which of those
 three failed, which is the difference between "select a different device" and
 "file a bug."
 
+### 3. If the transcript contains both your own voice and the interviewer's
+
+Verity has no speaker separation — it transcribes whatever is in the captured
+stream, whichever voice that is. If your own words show up mixed into the
+same transcript as the interviewer's, the stream being captured already
+contains both, before Verity ever sees it. That is a Windows/driver setting,
+not something app code can filter after the fact:
+
+- **Windows: check "Listen to this device."** Sound Control Panel → Recording
+  tab → your microphone → Properties → Listen. If enabled, Windows plays your
+  mic back through your speakers in real time — which loopback then dutifully
+  captures right alongside the interviewer. Turn it off.
+- Confirm you are actually on the loopback/system-audio device, not the
+  microphone (check the label in the Interview audio dropdown, or `debug.log`
+  from step 2). On the microphone, picking up both voices is expected: it
+  hears you directly and the interviewer through your speakers, exactly as
+  the table at the top of this README describes.
+- A headset removes the acoustic path entirely (nothing to bleed from
+  speaker to mic in the first place), so it is the most reliable fix when
+  the above doesn't resolve it.
+
 ---
 
 ## Running it

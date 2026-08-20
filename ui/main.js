@@ -6,6 +6,37 @@ const $ = (id) => document.getElementById(id);
 
 let captureProtectionEnabled = true;
 let devices = [];
+let currentQuestion = "";
+let threadTurns = 0;
+
+// Appended once per finished turn, on "answer.complete" — not built up live
+// on every "answer.delta", so a streaming answer only ever touches the DOM
+// nodes in the live cards above, not a growing thread list on every token.
+function appendThreadTurn(question, answer) {
+  if (!question && !answer) return;
+  $("thread-empty")?.remove();
+  const item = document.createElement("div");
+  item.className = "thread-item";
+  const q = document.createElement("p");
+  q.className = "thread-q";
+  q.textContent = question || "(question not transcribed)";
+  const a = document.createElement("p");
+  a.className = "thread-a";
+  a.textContent = answer || "(no answer)";
+  item.append(q, a);
+  $("thread-list").append(item);
+  threadTurns += 1;
+  $("thread-count").textContent = `${threadTurns} turn${threadTurns === 1 ? "" : "s"}`;
+  item.scrollIntoView({ block: "nearest" });
+}
+
+function resetThread() {
+  currentQuestion = "";
+  threadTurns = 0;
+  $("thread-count").textContent = "";
+  $("thread-list").innerHTML =
+    '<p id="thread-empty" class="thread-empty">Questions and answers will collect here as the interview goes, so you can scroll back through what was already asked.</p>';
+}
 
 function parseKeys(textareaId) {
   return [...new Set($(textareaId).value.split(/[\n,]+/).map((key) => key.trim()).filter(Boolean))];
@@ -316,6 +347,7 @@ listenOrReport("verity://event", ({ payload }) => {
   switch (kind) {
     case "session.ready":
       $("status").textContent = "Listening";
+      resetThread();
       break;
     case "stt.started":
       $("status").textContent = "Transcribing";
@@ -341,7 +373,8 @@ listenOrReport("verity://event", ({ payload }) => {
       break;
     }
     case "question.finalized":
-      $("question").textContent = String(data.content ?? "");
+      currentQuestion = String(data.content ?? "");
+      $("question").textContent = currentQuestion;
       $("direction").textContent = "Generating your answer…";
       $("points").innerHTML = "";
       $("structure").textContent = "";
@@ -352,11 +385,14 @@ listenOrReport("verity://event", ({ payload }) => {
       $("status").textContent = "Answering";
       $("latency").textContent = latencyText(data);
       break;
-    case "answer.complete":
-      renderAnswer(data.content ?? {});
+    case "answer.complete": {
+      const content = data.content ?? {};
+      renderAnswer(content);
+      appendThreadTurn(currentQuestion, content.answer_direction);
       $("status").textContent = "Ready";
       $("latency").textContent = latencyText(data, true);
       break;
+    }
     case "warning":
       $("status").textContent = "Needs attention";
       $("hud-error").textContent = String(data.message ?? "The AI request failed.");

@@ -533,3 +533,69 @@ button {
   background: linear-gradient(90deg, var(--positive), #7fe8a8);
   transition: width 80ms linear;
 }
+
+/* ── Conversation thread ──────────────────────────────────────── */
+
+.thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+.thread-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.thread-count {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.thread-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.thread-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.thread-item:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+.thread-q,
+.thread-a {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.thread-q {
+  color: var(--muted);
+}
+.thread-q::before {
+  content: "Q  ";
+  font-weight: 700;
+  color: var(--muted);
+}
+.thread-a {
+  color: var(--text);
+}
+.thread-a::before {
+  content: "A  ";
+  font-weight: 700;
+  color: var(--accent);
+}

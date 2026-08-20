@@ -16,7 +16,18 @@ use tokio::sync::mpsc;
 
 const SILENCE_FLUSH_MS: u64 = 360;
 const MIN_VOICE_MS: u64 = 300;
-const MAX_UTTERANCE_MS: u64 = 10_000;
+/// A hard cap, not a target: segmentation normally flushes on
+/// `SILENCE_FLUSH_MS` of quiet, so this only fires when voice keeps crossing
+/// the threshold continuously with no gap that long. There is no speaker
+/// separation here — if the captured stream itself contains more than one
+/// voice with no silence between them (cross-talk, or the candidate's own
+/// mic bleeding into what should be call-only audio, e.g. Windows' "Listen
+/// to this device" mic monitoring), everything voiced in that stretch
+/// becomes one utterance regardless of who is actually speaking. Was 10s;
+/// lower bounds how much of a mixed stream can blend into a single
+/// transcript. Real interview questions are almost never a continuous 7s of
+/// speech with no pause, so this should rarely clip a legitimate one.
+const MAX_UTTERANCE_MS: u64 = 7_000;
 /// Fallback only, used until calibration below produces a real number:
 /// captured loopback level varies hugely by OS and sound driver (a Realtek
 /// Windows loopback measured an order of magnitude quieter here than the
@@ -61,7 +72,18 @@ const STT_MODEL: &str = "whisper-large-v3-turbo";
 const DEFAULT_CHAT_MODEL: &str = "allam-2-7b";
 /// Recent Q&A pairs kept so a follow-up like "what was the hardest part?"
 /// still has an antecedent, without unbounded prompt growth.
-const MAX_HISTORY_TURNS: usize = 6;
+///
+/// Was 6. Measured live against Groq: with the resume and job description
+/// each sent in full on every single request (see CONTEXT_FIELD_MAX_CHARS),
+/// a worst-case prompt cost 2,418 tokens against this key's 6,000
+/// tokens-per-minute cap — enough to exhaust it in 2-3 questions, exactly the
+/// failure reported. Cutting history to 3 turns and the two context fields to
+/// 1,500 characters each measured 800 tokens for the same worst case, real
+/// headroom for roughly 7 requests/minute instead of 2.
+const MAX_HISTORY_TURNS: usize = 3;
+/// See MAX_HISTORY_TURNS above for the measurement this was cut from (6,000
+/// characters) to.
+const CONTEXT_FIELD_MAX_CHARS: usize = 1_500;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -716,8 +738,8 @@ async fn stream_answer(
         ("", company) => format!("an interview at {company}"),
         (role, company) => format!("an interview for {role} at {company}"),
     };
-    let resume = truncate_context(&settings.resume_text, 6_000);
-    let job_description = truncate_context(&settings.job_description, 6_000);
+    let resume = truncate_context(&settings.resume_text, CONTEXT_FIELD_MAX_CHARS);
+    let job_description = truncate_context(&settings.job_description, CONTEXT_FIELD_MAX_CHARS);
     let conversation = format_conversation(history);
     let prompt = format!(
         "You are a live interview answer coach. The candidate is in {context}. \
