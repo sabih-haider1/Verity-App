@@ -49,7 +49,11 @@ impl Default for Preferences {
             resume_text: String::new(),
             job_description: String::new(),
             language: "en".to_string(),
-            chat_model: "allam-2-7b".to_string(),
+            // Kept in sync with session::DEFAULT_CHAT_MODEL — this field
+            // being non-empty from the moment a fresh preferences file is
+            // created means that fallback in session.rs never actually
+            // triggers in practice; this is the value new installs get.
+            chat_model: "openai/gpt-oss-20b".to_string(),
             chat_provider: "groq".to_string(),
             chat_api_keys: Vec::new(),
             permissions_primed: false,

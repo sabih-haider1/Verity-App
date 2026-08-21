@@ -63,13 +63,17 @@ const MAX_VOICE_RMS_THRESHOLD: f32 = 0.05;
 /// reads as a mid-to-high bar with headroom before clipping.
 const LEVEL_REFERENCE_ABOVE_THRESHOLD: f32 = 6.0;
 const STT_MODEL: &str = "whisper-large-v3-turbo";
-// Measured against the live Groq API: openai/gpt-oss-20b's time-to-first-
-// token ranged 300ms-1.3s+ (occasionally 500-erroring) across otherwise
-// identical warm-connection requests, while allam-2-7b answered the same
-// prompts in a consistent ~120-140ms with equivalent quality once the
-// prompt explicitly forbade preamble/meta-commentary. Swapped for the
-// latency-sensitive default; still user-overridable in Advanced settings.
-const DEFAULT_CHAT_MODEL: &str = "allam-2-7b";
+// allam-2-7b was the default before this: consistently fast (~120-140ms
+// TTFT measured earlier), but verified unreliable at the two things the
+// prompt above asks for — switching to bullet points for a definitional
+// question, and not leaking a literal "You:" label, both confirmed live
+// against the real API. openai/gpt-oss-20b, with the reasoning_effort
+// params is_reasoning_model already sends, got both right consistently
+// across repeated live tests (~1s wall time each) and carries a *higher*
+// per-key token-per-minute budget on Groq (8,000 vs. allam's 6,000), so
+// this is not a quota regression. A saved chat_model preference always
+// wins over this default regardless.
+const DEFAULT_CHAT_MODEL: &str = "openai/gpt-oss-20b";
 /// Recent Q&A pairs kept so a follow-up like "what was the hardest part?"
 /// still has an antecedent, without unbounded prompt growth.
 ///
@@ -84,6 +88,14 @@ const MAX_HISTORY_TURNS: usize = 3;
 /// See MAX_HISTORY_TURNS above for the measurement this was cut from (6,000
 /// characters) to.
 const CONTEXT_FIELD_MAX_CHARS: usize = 1_500;
+/// Was 160 (roughly the old 90-word narrative cap). A bullet-point answer
+/// needs headroom past that: a short lead-in sentence plus 3-5 points each
+/// carries its own marker/newline overhead on top of the words themselves,
+/// and 160 was tight enough to risk the model's last point being truncated
+/// mid-sentence. This adds ~60 output tokens per request — negligible next
+/// to the ~800-token full request measured when the context fields above
+/// were cut down, so it doesn't meaningfully undo that budget fix.
+const MAX_ANSWER_TOKENS: u32 = 220;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -678,7 +690,7 @@ fn build_chat_request(
                 "messages": [{ "role": "user", "content": prompt }],
                 "stream": true,
                 "temperature": 0.3,
-                "max_completion_tokens": 160
+                "max_completion_tokens": MAX_ANSWER_TOKENS
             });
             // reasoning_effort/include_reasoning are Groq extensions only
             // the gpt-oss family accepts — every other model, including
@@ -697,7 +709,7 @@ fn build_chat_request(
         ChatProvider::Anthropic => {
             let body = json!({
                 "model": model,
-                "max_tokens": 160,
+                "max_tokens": MAX_ANSWER_TOKENS,
                 "temperature": 0.3,
                 "stream": true,
                 "messages": [{ "role": "user", "content": prompt }]
@@ -711,7 +723,7 @@ fn build_chat_request(
         ChatProvider::Gemini => {
             let body = json!({
                 "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
-                "generationConfig": { "temperature": 0.3, "maxOutputTokens": 160 }
+                "generationConfig": { "temperature": 0.3, "maxOutputTokens": MAX_ANSWER_TOKENS }
             });
             let url = format!(
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent"
@@ -734,7 +746,7 @@ fn build_chat_request(
             // Converse API reference, not guessed.
             let body = json!({
                 "messages": [{ "role": "user", "content": [{ "text": prompt }] }],
-                "inferenceConfig": { "maxTokens": 160, "temperature": 0.3 }
+                "inferenceConfig": { "maxTokens": MAX_ANSWER_TOKENS, "temperature": 0.3 }
             });
             let url = format!(
                 "https://bedrock-runtime.{BEDROCK_REGION}.amazonaws.com/model/{model}/converse"
@@ -798,15 +810,34 @@ async fn stream_answer(
     let conversation = format_conversation(history);
     let prompt = format!(
         "You are a live interview answer coach. The candidate is in {context}. \
-         Output ONLY the exact words the candidate should say aloud right now — never comment on the \
-         resume, never explain your reasoning or what you're about to do, never start with phrases like \
-         \"While reviewing...\" or \"I notice...\" or \"As a safe answer...\". The very first word must be \
-         part of the spoken answer itself. \
-         Write in first person, be confident and natural, and stay under 90 words. \
+         Output ONLY the exact words the candidate should say aloud right now. Never comment on the \
+         resume, never explain your reasoning, never start with phrases like \"While reviewing...\" or \
+         \"I notice...\". Never write a speaker label like \"You:\" or \"Interviewer:\" — RECENT \
+         CONVERSATION below is reference material, not a transcript to continue; write only the new \
+         answer itself, nothing else. \
          Use only facts supported by the resume. Align to the job description without copying it. \
-         If personal facts are unknown, still answer directly in first person with a safe adaptable \
-         response — never invent employers, dates, or metrics, and never tell the candidate that facts are missing. \
-         If the question refers back to something earlier (e.g. \"the hardest part\", \"that project\"), resolve it using the recent conversation below.\n\n\
+         If personal facts are unknown, still answer directly with a safe adaptable response — never \
+         invent employers, dates, or metrics, and never tell the candidate that facts are missing. \
+         If the question refers back to something earlier (e.g. \"the hardest part\", \"that project\"), \
+         resolve it using the recent conversation below.\n\n\
+         Pick ONE of these two formats based on what the question is actually asking:\n\n\
+         FORMAT A — PERSONAL / BEHAVIORAL (about the candidate's own experience, a past situation, \
+         motivation, strengths, weaknesses): a first-person narrative, 2-4 sentences, confident and \
+         natural, under 70 words. No bullets. Example, if asked \"What's your biggest strength?\":\n\
+         I stay calm under pressure and focus on root causes instead of quick patches. When a production \
+         issue came up, I traced it back to a misconfigured cache instead of just restarting the service, \
+         which stopped it recurring for good.\n\n\
+         FORMAT B — DEFINITION / EXPLANATION / REASONING (\"what is X\", \"explain Y\", \"how does Z \
+         work\", \"walk me through...\", \"what's the difference between...\"): at most one short lead-in \
+         sentence, then 3-5 bullet points, each on its own line starting with exactly \"- \", each short \
+         enough to read aloud in a few seconds. Example, if asked \"What is a CI/CD pipeline?\":\n\
+         A CI/CD pipeline automates getting code from commit to production:\n\
+         - Continuous Integration merges and tests changes frequently\n\
+         - Continuous Delivery keeps every build in a deployable state\n\
+         - Continuous Deployment ships each passing change automatically\n\n\
+         Never open two answers in a row the same way. RECENT CONVERSATION below is what was already \
+         said — if it already led with a specific company, project, or sentence structure, this answer \
+         must open differently and, where the resume supports it, use a different example.\n\n\
          RESUME CONTEXT:\n{resume}\n\nJOB DESCRIPTION:\n{job_description}\n\nRECENT CONVERSATION:\n{conversation}\n\nINTERVIEWER QUESTION:\n{question}"
     );
     let provider = settings.chat_provider;
@@ -933,13 +964,15 @@ async fn stream_answer(
     }
     let total_ms = detection_delay_ms + queued_at.elapsed().as_millis() as u64;
     let generation_ms = generation_started.elapsed().as_millis() as u64;
+    let cleaned = strip_leaked_speaker_label(answer.trim());
+    let (direction, key_points) = split_into_direction_and_points(cleaned);
     emit(
         app,
         "answer.complete",
         json!({
             "content": {
-                "answer_direction": answer.trim(),
-                "key_points": [],
+                "answer_direction": direction,
+                "key_points": key_points,
                 "structure": ""
             },
             "first_response_ms": first_token_ms,
@@ -949,7 +982,13 @@ async fn stream_answer(
             "total_ms": total_ms
         }),
     );
-    Ok(answer.trim().to_string())
+    // History keeps the raw (label-stripped) text, bullets and all: the
+    // anti-repetition instruction tells the model to look at what it
+    // already said, so it needs to see the actual structure it used last
+    // time, not a version already split apart for display — but a leaked
+    // "You:" must not persist into history either, or the next turn reads
+    // it back as an example of the pattern to continue.
+    Ok(cleaned.to_string())
 }
 
 /// True exactly when accumulating `duration_ms` onto `before` crosses a
@@ -959,13 +998,81 @@ fn crosses_interval(before: u64, after: u64, interval: u64) -> bool {
     after / interval > before / interval
 }
 
+/// Splits the model's final answer into a short lead-in and a list of bullet
+/// points, per the two formats the prompt asks for. A personal/behavioral
+/// answer is expected to contain no bullet lines at all — that is a fully
+/// valid, common shape, not a parse failure — and returns no points, with
+/// the whole text as the direction, exactly like before this split existed.
+///
+/// Markers checked: "- ", "• ", "* ", each followed by real content. Numbered
+/// lists ("1. ...") are deliberately not recognized — the prompt asks for
+/// "- " specifically, and treating bare digits as a bullet marker risks
+/// swallowing a real sentence that happens to start with a number.
+/// Defense in depth for the prompt's "never write a speaker label" rule:
+/// verified live against a real model that, despite that explicit
+/// instruction, it still opened an answer with a literal "You:" — models
+/// don't reliably follow this every time, so it is also stripped
+/// deterministically here rather than trusted to prompt compliance alone.
+/// Only this short, specific set of known leak patterns, never any generic
+/// "word:" prefix — a definitional answer legitimately might start with a
+/// term followed by a colon (e.g. "CI/CD: it automates...").
+fn strip_leaked_speaker_label(text: &str) -> &str {
+    const LABELS: [&str; 5] = ["you:", "candidate:", "interviewer:", "answer:", "a:"];
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    for label in LABELS {
+        if lower.starts_with(label) {
+            return trimmed[label.len()..].trim_start();
+        }
+    }
+    trimmed
+}
+
+fn split_into_direction_and_points(answer: &str) -> (String, Vec<String>) {
+    let mut direction_lines = Vec::new();
+    let mut points = Vec::new();
+    for line in answer.lines() {
+        let trimmed = line.trim();
+        match bullet_content(trimmed) {
+            Some(point) if !point.is_empty() => points.push(point.to_string()),
+            Some(_) => {} // a marker with nothing after it (e.g. "- "): drop, not a blank point
+            None if !trimmed.is_empty() => direction_lines.push(trimmed.to_string()),
+            None => {}
+        }
+    }
+    (direction_lines.join(" "), points)
+}
+
+/// `line` is already trimmed. Requires the marker be followed by whitespace
+/// or be the whole line, so "-5" and "*emphasis*" are left as ordinary text
+/// rather than misread as bullets — trimming the marker off first and
+/// checking for a literal "- " would miss an intentionally empty bullet like
+/// "- ", since trimming the line already ate that trailing space.
+fn bullet_content(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix('-')
+        .or_else(|| line.strip_prefix('•'))
+        .or_else(|| line.strip_prefix('*'))?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
 fn format_conversation(history: &[(String, String)]) -> String {
     if history.is_empty() {
         return "None yet.".to_string();
     }
+    // Bracketed, clearly-structural labels — not "Interviewer:"/"You:".
+    // Verified live against Groq: those looked enough like an actual
+    // dialogue transcript that a real model continued the pattern, opening
+    // its own new answer with a literal "You:" prefix and repeating the
+    // previous turn's story almost verbatim instead of treating this as
+    // reference material to write something new from.
     history
         .iter()
-        .map(|(q, a)| format!("Interviewer: {q}\nYou: {a}"))
+        .map(|(q, a)| format!("[Previously asked] {q}\n[Previous answer] {a}"))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1103,6 +1210,107 @@ mod tests {
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(&wav[40..44], &4_u32.to_le_bytes());
         assert_eq!(&wav[44..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_plain_narrative_answer_has_no_points() {
+        // The common, expected shape for a personal/behavioral question —
+        // no bullet markers at all, so the whole thing stays one direction.
+        let answer = "I led the migration myself and it cut our deploy time in half.";
+        let (direction, points) = split_into_direction_and_points(answer);
+        assert_eq!(direction, answer);
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn a_lead_in_plus_bullets_splits_into_both() {
+        let answer = "CI/CD automates getting code from commit to production:\n\
+             - Continuous Integration merges and tests changes frequently\n\
+             - Continuous Delivery keeps the build always deployable\n\
+             - Continuous Deployment ships every passing change automatically";
+        let (direction, points) = split_into_direction_and_points(answer);
+        assert_eq!(
+            direction,
+            "CI/CD automates getting code from commit to production:"
+        );
+        assert_eq!(
+            points,
+            vec![
+                "Continuous Integration merges and tests changes frequently",
+                "Continuous Delivery keeps the build always deployable",
+                "Continuous Deployment ships every passing change automatically",
+            ]
+        );
+    }
+
+    #[test]
+    fn bullets_with_no_lead_in_leave_direction_empty_not_missing() {
+        let answer = "- First point\n- Second point";
+        let (direction, points) = split_into_direction_and_points(answer);
+        assert_eq!(direction, "");
+        assert_eq!(points, vec!["First point", "Second point"]);
+    }
+
+    #[test]
+    fn every_common_bullet_marker_is_recognized() {
+        let answer = "- dash\n• dot\n* star";
+        let (_, points) = split_into_direction_and_points(answer);
+        assert_eq!(points, vec!["dash", "dot", "star"]);
+    }
+
+    #[test]
+    fn an_empty_bullet_line_is_dropped_not_kept_as_a_blank_point() {
+        let answer = "Intro line\n- \n- real point";
+        let (direction, points) = split_into_direction_and_points(answer);
+        assert_eq!(direction, "Intro line");
+        assert_eq!(points, vec!["real point"]);
+    }
+
+    #[test]
+    fn empty_input_produces_empty_direction_and_no_points() {
+        let (direction, points) = split_into_direction_and_points("");
+        assert_eq!(direction, "");
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn known_leaked_speaker_labels_are_stripped() {
+        assert_eq!(
+            strip_leaked_speaker_label("You: I led the migration myself."),
+            "I led the migration myself."
+        );
+        assert_eq!(
+            strip_leaked_speaker_label("Interviewer: that's a great question"),
+            "that's a great question"
+        );
+        // Case-insensitive, and works with no space after the colon too.
+        assert_eq!(strip_leaked_speaker_label("YOU:hello"), "hello");
+    }
+
+    #[test]
+    fn a_definitional_answer_starting_with_a_term_and_colon_is_left_alone() {
+        // "CI/CD:" is not a speaker label — stripping any generic "word:"
+        // prefix would corrupt a legitimate definitional answer that opens
+        // exactly this way, which is a common, correct shape for FORMAT B.
+        let answer = "CI/CD: it automates getting code from commit to production.";
+        assert_eq!(strip_leaked_speaker_label(answer), answer);
+    }
+
+    #[test]
+    fn text_with_no_label_at_all_is_returned_unchanged() {
+        let answer = "I focus on root causes instead of quick patches.";
+        assert_eq!(strip_leaked_speaker_label(answer), answer);
+    }
+
+    #[test]
+    fn a_dash_not_followed_by_whitespace_is_not_mistaken_for_a_bullet() {
+        // "we cut latency by -5ms" and "*emphasis*" are ordinary sentences,
+        // not bullets — a marker character glued to real content, not
+        // followed by whitespace or standing alone, must stay untouched.
+        let answer = "Throughput improved -5ms on average.\n*emphasis* still reads as text.";
+        let (direction, points) = split_into_direction_and_points(answer);
+        assert_eq!(direction, answer.replace('\n', " "));
+        assert!(points.is_empty());
     }
 
     #[test]
@@ -1292,7 +1500,7 @@ mod tests {
             serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
-        assert_eq!(body["inferenceConfig"]["maxTokens"], 160);
+        assert_eq!(body["inferenceConfig"]["maxTokens"], MAX_ANSWER_TOKENS);
         // The non-streaming endpoint, not converse-stream: Bedrock's real
         // streaming format is AWS's binary vnd.amazon.eventstream framing,
         // not text SSE, and was never verified against a real successful
@@ -1362,7 +1570,7 @@ mod tests {
         )];
         assert_eq!(
             format_conversation(&history),
-            "Interviewer: Tell me about a project.\nYou: I built..."
+            "[Previously asked] Tell me about a project.\n[Previous answer] I built..."
         );
     }
 

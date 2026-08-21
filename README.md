@@ -266,7 +266,7 @@ below it is only for whichever provider is currently selected.
 
 | Provider | Needs its own key | Default model |
 |---|---|---|
-| Groq | No — reuses the keys above | `allam-2-7b` |
+| Groq | No — reuses the keys above | `openai/gpt-oss-20b` |
 | OpenAI | Yes | `gpt-4o-mini` |
 | Anthropic (Claude) | Yes | `claude-haiku-4-5-20251001` |
 | Google Gemini | Yes | `gemini-2.0-flash` |

@@ -593,6 +593,10 @@ button {
 }
 .thread-a {
   color: var(--text);
+  /* A bullet-point answer's key_points are folded into this text with real
+     newlines (see main.js's answer.complete handler) — without this, they
+     would render collapsed onto one squished line instead of one per point. */
+  white-space: pre-line;
 }
 .thread-a::before {
   content: "A  ";

@@ -64,7 +64,10 @@ function chatProviderNeedsOwnKeys() {
 }
 
 const CHAT_PROVIDER_DEFAULT_MODEL = {
-  groq: 'allam-2-7b',
+  // Verified live: openai/gpt-oss-20b reliably switches to bullet points
+  // for a definitional question and never leaked a "You:" label across
+  // repeated tests, where the faster allam-2-7b did neither reliably.
+  groq: 'openai/gpt-oss-20b',
   openai: 'gpt-4o-mini',
   anthropic: 'claude-haiku-4-5-20251001',
   gemini: 'gemini-2.0-flash',
@@ -142,7 +145,7 @@ async function initialize() {
     $("language").value = settings.language || "en";
     $("chat-provider").value = settings.chat_provider || "groq";
     $("chat-api-keys").value = (settings.chat_api_keys ?? []).join("\n");
-    $("chat-model").value = settings.chat_model || CHAT_PROVIDER_DEFAULT_MODEL[$("chat-provider").value] || "allam-2-7b";
+    $("chat-model").value = settings.chat_model || CHAT_PROVIDER_DEFAULT_MODEL[$("chat-provider").value] || "openai/gpt-oss-20b";
     updateChatProviderVisibility();
     renderCaptureProtection(settings.protect_hud_from_screen_capture !== false);
     updateKeyHint();
@@ -327,8 +330,13 @@ $("protect-btn").addEventListener("click", () => {
 });
 
 function renderAnswer(content) {
-  $("direction").textContent = content.answer_direction || "No answer was returned.";
-  $("points").innerHTML = (content.key_points ?? [])
+  const points = content.key_points ?? [];
+  // A points-only answer (a definition/explanation question) legitimately
+  // has no lead-in sentence — that must not read as "nothing came back"
+  // just because the direction line itself is empty.
+  $("direction").textContent =
+    content.answer_direction || (points.length ? "" : "No answer was returned.");
+  $("points").innerHTML = points
     .map((point) => `<li>${escapeHtml(point.text ?? point)}</li>`)
     .join("");
   $("structure").textContent = content.structure || "";
@@ -408,7 +416,14 @@ listenOrReport("verity://event", ({ payload }) => {
     case "answer.complete": {
       const content = data.content ?? {};
       renderAnswer(content);
-      appendThreadTurn(currentQuestion, content.answer_direction);
+      // A points-only answer has no lead-in sentence; without folding the
+      // points in here too, the thread would log an empty "A" line for
+      // every definition/explanation question.
+      const points = content.key_points ?? [];
+      const threadAnswer = [content.answer_direction, ...points.map((p) => `• ${p.text ?? p}`)]
+        .filter(Boolean)
+        .join("\n");
+      appendThreadTurn(currentQuestion, threadAnswer);
       $("status").textContent = "Ready";
       $("latency").textContent = latencyText(data, true);
       break;
