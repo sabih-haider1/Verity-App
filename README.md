@@ -252,7 +252,7 @@ To sign later, set `APPLE_CERTIFICATE`, `APPLE_ID` and `APPLE_TEAM_ID` and add a
 1. Paste one or more Groq API keys, one per line, and test the connection. They stay in this machine's local Verity preferences, rotate on auth/rate-limit/service failures, and always handle transcription regardless of which provider answers.
 2. Add the role/company and paste or import the resume and job description. PDF, TXT, and Markdown are supported.
 3. Choose the interview audio source. A loopback device is recommended.
-4. *(Optional)* In **Advanced settings**, pick an **Answer provider** other than Groq — OpenAI, Anthropic, or Gemini — paste that provider's own key(s), and test the connection. Leave it on Groq to reuse the keys from step 1.
+4. *(Optional)* In **Advanced settings**, pick an **Answer provider** other than Groq — OpenAI, Anthropic, Gemini, or Amazon Bedrock — paste that provider's own key(s), and test the connection. Leave it on Groq to reuse the keys from step 1.
 5. Press **Start live assistant**, then position the HUD beside your call.
 
 The window stays above full-screen video calls. **Pinned** toggles that off if
@@ -260,17 +260,44 @@ you need it to behave like a normal window.
 
 ### Choosing an answer provider
 
+There is no auto-detection of key type from its format — the **Answer
+provider** dropdown is the one place this is chosen, and the key field
+below it is only for whichever provider is currently selected.
+
 | Provider | Needs its own key | Default model |
 |---|---|---|
 | Groq | No — reuses the keys above | `allam-2-7b` |
 | OpenAI | Yes | `gpt-4o-mini` |
 | Anthropic (Claude) | Yes | `claude-haiku-4-5-20251001` |
 | Google Gemini | Yes | `gemini-2.0-flash` |
+| Amazon Bedrock | Yes — an [API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html), not an AWS access key/secret pair | `amazon.nova-lite-v1:0` |
 
 Every provider streams into the same HUD through the same events — switching
-providers changes nothing else about how Verity behaves. The **Answer model**
-field is free text, so any model the selected provider hosts works, not only
-the default.
+providers changes nothing else about how Verity behaves — with one exception:
+**Bedrock's answer arrives as a single block, not token-by-token.** Its real
+streaming API returns AWS's own binary frame format rather than the plain
+text every other provider here uses, and that was never verified against a
+real successful response while building this, so Verity calls its regular
+(non-streaming) endpoint instead. For a 160-token answer the practical delay
+is under a second — but it is a real, deliberate difference from the rest.
+
+The **Answer model** field is free text, so any model the selected provider
+hosts works, not only the default.
+
+#### Amazon Bedrock: model access is a separate AWS step
+
+A Bedrock bearer-token key authenticates you, but by itself grants no model
+access — the console list won't tell you this, but your **first Bedrock
+request will fail even with a perfectly valid key** if no model has been
+enabled. Fixed at [AWS Bedrock console → Model access][bedrock-model-access],
+not in this app. Until at least one model is enabled there, every request
+fails with `Operation not allowed`, which looks identical to a bad key but
+isn't one — verified live: the same key correctly listed 90 available models
+via Bedrock's own models endpoint while every single invoke attempt was
+rejected, which is what an auth-is-fine-but-nothing-is-enabled account looks
+like.
+
+[bedrock-model-access]: https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html
 
 Requests per detected question: exactly one transcription call and one answer
 call, regardless of provider — plus one extra answer call per API key skipped

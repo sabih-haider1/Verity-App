@@ -68,6 +68,11 @@ const CHAT_PROVIDER_DEFAULT_MODEL = {
   openai: 'gpt-4o-mini',
   anthropic: 'claude-haiku-4-5-20251001',
   gemini: 'gemini-2.0-flash',
+  // Requires enabling model access for this model in the AWS Bedrock
+  // console before it will actually invoke — a mandatory one-time AWS
+  // account step, unrelated to this app. Bearer-token auth alone doesn't
+  // grant it.
+  bedrock: 'amazon.nova-lite-v1:0',
 };
 
 function updateChatProviderVisibility() {

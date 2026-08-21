@@ -164,16 +164,25 @@ pub async fn test_api_keys(api_keys: &[String]) -> Result<ApiTestResult> {
 
 /// Which service generates the spoken answer. Transcription always stays on
 /// Groq Whisper regardless of this choice: Anthropic has no audio
-/// transcription endpoint at all, and Gemini's audio input is a different
-/// request shape than a Whisper-style transcribe call, so only answer
-/// generation is genuinely interchangeable across all four.
+/// transcription endpoint at all, Gemini's audio input is a different
+/// request shape than a Whisper-style transcribe call, and Bedrock has no
+/// STT-equivalent endpoint reachable with just an API key either — so only
+/// answer generation is genuinely interchangeable across all five.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatProvider {
     Groq,
     OpenAi,
     Anthropic,
     Gemini,
+    Bedrock,
 }
+
+/// Bedrock API keys are auth only, not a region selector — the region is
+/// baked into the endpoint URL, not the key. Hardcoded rather than a new
+/// settings field, to keep Bedrock "paste a key, pick a provider" like every
+/// other provider instead of the one exception with an extra required field.
+/// A key generated for a different region would need this changed to match.
+const BEDROCK_REGION: &str = "us-east-1";
 
 impl ChatProvider {
     pub fn parse(value: &str) -> Self {
@@ -181,6 +190,7 @@ impl ChatProvider {
             "openai" => Self::OpenAi,
             "anthropic" | "claude" => Self::Anthropic,
             "gemini" | "google" => Self::Gemini,
+            "bedrock" | "amazon" | "amazon-bedrock" | "aws" => Self::Bedrock,
             _ => Self::Groq,
         }
     }
@@ -191,6 +201,7 @@ impl ChatProvider {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
+            Self::Bedrock => "bedrock",
         }
     }
 
@@ -200,6 +211,7 @@ impl ChatProvider {
             Self::OpenAi => "OpenAI",
             Self::Anthropic => "Anthropic",
             Self::Gemini => "Gemini",
+            Self::Bedrock => "Amazon Bedrock",
         }
     }
 
@@ -211,6 +223,15 @@ impl ChatProvider {
             // the older 3.5 Haiku line - keep in sync if that roster moves.
             Self::Anthropic => "claude-haiku-4-5-20251001",
             Self::Gemini => "gemini-2.0-flash",
+            // Unverified against a real successful generation: every model
+            // tried on the account this was built against returned
+            // "Operation not allowed" (400), not an auth failure — Bedrock
+            // requires enabling access per model family in the AWS console
+            // before ANY model can be invoked, regardless of which one is
+            // named here. Amazon's own Nova line needs no separate
+            // third-party EULA acceptance, making it the least-friction
+            // default once access is granted.
+            Self::Bedrock => "amazon.nova-lite-v1:0",
         }
     }
 
@@ -231,6 +252,15 @@ impl ChatProvider {
             Self::Gemini => client
                 .get("https://generativelanguage.googleapis.com/v1beta/models")
                 .query(&[("key", api_key)]),
+            // Verified live: returns 200 with the account's real foundation
+            // model list on a bearer token that has no model-invoke access
+            // granted at all yet, so this proves auth independent of
+            // whether any model is actually usable.
+            Self::Bedrock => client
+                .get(format!(
+                    "https://bedrock.{BEDROCK_REGION}.amazonaws.com/foundation-models"
+                ))
+                .bearer_auth(api_key),
         }
     }
 }
@@ -691,6 +721,26 @@ fn build_chat_request(
                 .query(&[("alt", "sse"), ("key", api_key)])
                 .json(&body)
         }
+        ChatProvider::Bedrock => {
+            // The non-streaming Converse endpoint, deliberately, not
+            // ConverseStream: streaming Bedrock responses are framed in
+            // AWS's own binary vnd.amazon.eventstream format, not text SSE
+            // like every other provider here, and there was no way to
+            // verify that parser against a real successful response — every
+            // model tried returned "Operation not allowed" (a per-model
+            // access grant needed in the AWS console), never a success to
+            // inspect. This body shape and field names (inferenceConfig ->
+            // maxTokens/temperature) are verified against AWS's own
+            // Converse API reference, not guessed.
+            let body = json!({
+                "messages": [{ "role": "user", "content": [{ "text": prompt }] }],
+                "inferenceConfig": { "maxTokens": 160, "temperature": 0.3 }
+            });
+            let url = format!(
+                "https://bedrock-runtime.{BEDROCK_REGION}.amazonaws.com/model/{model}/converse"
+            );
+            client.post(url).bearer_auth(api_key).json(&body)
+        }
     }
 }
 
@@ -713,6 +763,11 @@ fn extract_delta_text(provider: ChatProvider, value: &serde_json::Value) -> Opti
         ChatProvider::Gemini => value["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
             .map(str::to_string),
+        // Structurally unreachable: stream_answer special-cases Bedrock into
+        // one non-streaming response before this SSE-line loop ever runs
+        // (see build_chat_request). Still needs a real arm for the match to
+        // be exhaustive.
+        ChatProvider::Bedrock => None,
     }
 }
 
@@ -804,46 +859,76 @@ async fn stream_answer(
     }
     let response = response.ok_or_else(|| anyhow!(last_error))?;
 
-    let mut stream = response.bytes_stream();
-    let mut pending = String::new();
     let mut answer = String::new();
     let mut first_token_ms = None;
-    while let Some(chunk) = stream.next().await {
-        pending.push_str(&String::from_utf8_lossy(&chunk?));
-        while let Some(newline) = pending.find('\n') {
-            let line = pending[..newline].trim().to_string();
-            pending.drain(..=newline);
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-            // Only Groq/OpenAI send this literal sentinel; Anthropic and
-            // Gemini simply close the connection when done, so this check
-            // is a no-op rather than a special case for those two.
-            if data == "[DONE]" {
-                break;
-            }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
-            let Some(delta) = extract_delta_text(provider, &value) else {
-                continue;
-            };
-            if delta.is_empty() {
-                continue;
-            }
-            answer.push_str(&delta);
+
+    if provider == ChatProvider::Bedrock {
+        // Converse (not ConverseStream — see build_chat_request) returns the
+        // whole answer in one JSON body, so it is emitted as a single
+        // answer.delta rather than the incremental stream every other
+        // provider produces. Same events, same shape the frontend already
+        // handles; the only difference is there is exactly one of them.
+        let value: serde_json::Value = response.json().await?;
+        let text = value["output"]["message"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !text.is_empty() {
+            answer.push_str(&text);
             let first = *first_token_ms
                 .get_or_insert_with(|| detection_delay_ms + queued_at.elapsed().as_millis() as u64);
             emit(
                 app,
                 "answer.delta",
                 json!({
-                    "delta": delta,
+                    "delta": text,
                     "content": answer,
                     "first_response_ms": first,
                     "stt_ms": stt_ms
                 }),
             );
+        }
+    } else {
+        let mut stream = response.bytes_stream();
+        let mut pending = String::new();
+        while let Some(chunk) = stream.next().await {
+            pending.push_str(&String::from_utf8_lossy(&chunk?));
+            while let Some(newline) = pending.find('\n') {
+                let line = pending[..newline].trim().to_string();
+                pending.drain(..=newline);
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                // Only Groq/OpenAI send this literal sentinel; Anthropic and
+                // Gemini simply close the connection when done, so this
+                // check is a no-op rather than a special case for those two.
+                if data == "[DONE]" {
+                    break;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                let Some(delta) = extract_delta_text(provider, &value) else {
+                    continue;
+                };
+                if delta.is_empty() {
+                    continue;
+                }
+                answer.push_str(&delta);
+                let first = *first_token_ms.get_or_insert_with(|| {
+                    detection_delay_ms + queued_at.elapsed().as_millis() as u64
+                });
+                emit(
+                    app,
+                    "answer.delta",
+                    json!({
+                        "delta": delta,
+                        "content": answer,
+                        "first_response_ms": first,
+                        "stt_ms": stt_ms
+                    }),
+                );
+            }
         }
     }
     let total_ms = detection_delay_ms + queued_at.elapsed().as_millis() as u64;
@@ -1080,12 +1165,15 @@ mod tests {
             ChatProvider::OpenAi,
             ChatProvider::Anthropic,
             ChatProvider::Gemini,
+            ChatProvider::Bedrock,
         ] {
             assert_eq!(ChatProvider::parse(provider.as_str()), provider);
         }
         // Aliases a user might reasonably type.
         assert_eq!(ChatProvider::parse("Claude"), ChatProvider::Anthropic);
         assert_eq!(ChatProvider::parse("GOOGLE"), ChatProvider::Gemini);
+        assert_eq!(ChatProvider::parse("AWS"), ChatProvider::Bedrock);
+        assert_eq!(ChatProvider::parse("Amazon"), ChatProvider::Bedrock);
         // An unrecognized or empty value must not silently pick a paid
         // provider the user never selected.
         assert_eq!(ChatProvider::parse(""), ChatProvider::Groq);
@@ -1099,6 +1187,7 @@ mod tests {
             ChatProvider::OpenAi,
             ChatProvider::Anthropic,
             ChatProvider::Gemini,
+            ChatProvider::Bedrock,
         ];
         let models: Vec<&str> = providers.iter().map(|p| p.default_model()).collect();
         assert!(models.iter().all(|m| !m.is_empty()));
@@ -1167,9 +1256,64 @@ mod tests {
             ChatProvider::OpenAi,
             ChatProvider::Anthropic,
             ChatProvider::Gemini,
+            ChatProvider::Bedrock,
         ] {
             assert_eq!(extract_delta_text(provider, &empty), None);
         }
+    }
+
+    #[test]
+    fn bedrock_request_uses_the_documented_converse_shape_and_endpoint() {
+        // Verified against AWS's own Converse API reference, not guessed:
+        // inferenceConfig.maxTokens/temperature (not max_tokens/temperature
+        // at the top level like the OpenAI-compatible providers), and
+        // content as an array of {"text": ...} blocks, not a bare string.
+        let client = reqwest::Client::new();
+        let request = build_chat_request(
+            &client,
+            ChatProvider::Bedrock,
+            "test-key",
+            "amazon.nova-lite-v1:0",
+            "hello",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.nova-lite-v1:0/converse"
+        );
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer test-key"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 160);
+        // The non-streaming endpoint, not converse-stream: Bedrock's real
+        // streaming format is AWS's binary vnd.amazon.eventstream framing,
+        // not text SSE, and was never verified against a real successful
+        // response (see build_chat_request's own comment for why).
+        assert!(!request.url().path().contains("stream"));
+    }
+
+    #[test]
+    fn bedrock_never_falls_back_to_groq_keys() {
+        let settings = Settings {
+            api_keys: vec!["gsk_should_not_be_used".to_string()],
+            role_title: String::new(),
+            company_name: String::new(),
+            resume_text: String::new(),
+            job_description: String::new(),
+            language: "en".to_string(),
+            chat_model: String::new(),
+            chat_provider: ChatProvider::Bedrock,
+            chat_api_keys: vec!["bedrock-key".to_string()],
+        };
+        assert_eq!(settings.effective_chat_keys(), &["bedrock-key".to_string()]);
     }
 
     #[test]
