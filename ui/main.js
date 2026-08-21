@@ -210,10 +210,25 @@ async function importDocument(button) {
   }
 }
 
+// The real <input type="file"> is visually hidden (styles.css .file-input)
+// and pointer-events: none, so it cannot be clicked directly — clicking the
+// visible button has to forward to it. Without this, "Import resume" never
+// opened a file picker at all: importDocument() ran immediately against
+// input.files, which was always empty, and always failed with "Choose a
+// document first," on every click, unconditionally.
 for (const button of document.querySelectorAll('.import-button')) {
-  button.addEventListener('click', async () => {
+  const input = $(button.dataset.file);
+  button.addEventListener('click', () => input.click());
+  input.addEventListener('change', async () => {
     $('setup-error').textContent = '';
-    try { await importDocument(button); } catch (error) { $('setup-error').textContent = String(error); }
+    try {
+      await importDocument(button);
+    } catch (error) {
+      $('setup-error').textContent = String(error);
+    } finally {
+      // Clear so choosing the exact same file again still fires "change".
+      input.value = '';
+    }
   });
 }
 
