@@ -110,3 +110,56 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.paths }}
           if-no-files-found: error
+
+  # Republishes the "latest" GitHub Release with every successful build on
+  # main, so there is always one permanent, discoverable link to download
+  # from - Actions artifacts expire (90 days) and need a GitHub login to
+  # even find; a Release does neither. Only runs after both installer jobs
+  # in the matrix above succeed, and only for real pushes to main (not
+  # PRs) or a manual run explicitly targeting main.
+  release:
+    name: Publish latest release
+    needs: [build]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten and clearly name the release assets
+        shell: bash
+        run: |
+          mkdir -p release
+          cp artifacts/verity-windows/src-tauri/target/release/bundle/nsis/*.exe release/
+          cp artifacts/verity-windows/src-tauri/target/release/bundle/msi/*.msi release/
+          cp artifacts/verity-macos/src-tauri/target/release/bundle/dmg/*.dmg release/
+          cp artifacts/verity-windows/dist-probe/audio-probe.exe release/audio-probe-windows.exe
+          cp artifacts/verity-macos/dist-probe/audio-probe release/audio-probe-macos
+          ls -la release
+
+      - name: Republish the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete-then-recreate, not upload --clobber: a version bump can
+          # change an asset's filename (Verity_0.2.0_... -> 0.3.0_...), and
+          # --clobber only overwrites files with matching names, which would
+          # leave old, stale, differently-named installers attached forever.
+          # --cleanup-tag also removes the old "latest" tag so the new one
+          # created below points at this commit, not a stale one.
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create latest release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Verity Desktop — latest build" \
+            --target main \
+            --notes "Built automatically from commit $(git rev-parse --short HEAD) on \`main\`. Replaced on every new build that lands here — see the [commit history](https://github.com/$GITHUB_REPOSITORY/commits/main) for what changed since your last download.
+
+          **Windows**: run \`Verity_*_x64-setup.exe\` (or the \`.msi\`). SmartScreen will warn it's unsigned — More info → Run anyway.
+
+          **macOS (Apple Silicon)**: open \`Verity_*_aarch64.dmg\`, drag Verity to Applications. Unsigned — right-click the app → Open the first time.
+
+          \`audio-probe-windows.exe\` / \`audio-probe-macos\`: a standalone audio-capture diagnostic, no API key or network needed — see the README's \"When nothing is being transcribed\" section."
